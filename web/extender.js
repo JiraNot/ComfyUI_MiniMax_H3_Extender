@@ -634,16 +634,18 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
     // below the already-visible video sockets. Rebuild only the visual socket
     // order after each sync while preserving the exact input objects and cables.
     // Desired order:
-    //   static model inputs
+    //   static model inputs (except trailing sigmas)
     //   ref_audio_1..3
     //   ref_video_1 / fps_1 / video_audio_1
     //   ref_video_2 / fps_2 / video_audio_2
     //   ref_video_3 / fps_3 / video_audio_3
     //   ref_pack / prompt_pack
+    //   sigmas (always last — never shift older optional indexes)
     if (!node?.inputs?.length) return false;
 
     const packOrder = ["ref_pack", "prompt_pack"];
-    const dynamicNames = new Set(packOrder);
+    const trailingNames = new Set(["sigmas"]);
+    const dynamicNames = new Set([...packOrder, ...trailingNames]);
     for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
         dynamicNames.add(`ref_audio_${i}`);
     }
@@ -677,6 +679,10 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
         }
     }
     for (const name of packOrder) {
+        const input = byName.get(name);
+        if (input) desired.push(input);
+    }
+    for (const name of trailingNames) {
         const input = byName.get(name);
         if (input) desired.push(input);
     }

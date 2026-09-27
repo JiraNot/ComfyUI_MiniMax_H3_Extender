@@ -103,7 +103,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.8.4"
+BUILD = "minimax-h3-extender-v2.8.5"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -1826,14 +1826,62 @@ def _sigmas(model, scheduler: str, steps: int, denoise: float):
     return sigmas[-(steps + 1):]
 
 
-def _sample_h3(model, conditioning, latent, seed: int, sampler_name: str, scheduler: str, steps: int, denoise: float):
-    if int(steps) < 1:
-        raise ValueError("MiniMax H3 Extender: steps must be >= 1.")
+def _trim_sigmas_by_denoise(sigmas, denoise: float):
+    """Keep the last round(nfe * denoise) sigma blocks for external schedules."""
+    denoise = float(denoise)
+    if sigmas is None:
+        return None
+    if denoise >= 1.0:
+        return sigmas
+    if denoise <= 0.0:
+        return torch.FloatTensor([])
+    nfe = max(1, int(sigmas.shape[-1]) - 1)
+    keep = max(1, int(round(nfe * denoise)))
+    return sigmas[-(keep + 1) :]
 
+
+def _coerce_external_sigmas(sigmas):
+    """Normalize an optional ComfyUI SIGMAS input; None when disconnected."""
+    if sigmas is None:
+        return None
+    if not torch.is_tensor(sigmas):
+        raise ValueError(
+            "MiniMax H3 Extender: optional sigmas input must be a SIGMAS tensor."
+        )
+    if int(sigmas.numel()) < 2:
+        raise ValueError(
+            "MiniMax H3 Extender: optional sigmas input is empty. Disconnect it "
+            "to use steps/scheduler, or connect a valid SIGMAS output."
+        )
+    return sigmas
+
+
+def _resolve_sample_sigmas(external_sigmas, denoise: float):
+    """Return denoise-trimmed external sigmas, or None to use steps/scheduler."""
+    coerced = _coerce_external_sigmas(external_sigmas)
+    if coerced is None:
+        return None
+    return _trim_sigmas_by_denoise(coerced, denoise)
+
+
+def _sample_h3(
+    model,
+    conditioning,
+    latent,
+    seed: int,
+    sampler_name: str,
+    scheduler: str,
+    steps: int,
+    denoise: float,
+    sigmas=None,
+):
     guider = _BasicGuider(model)
     guider.set_conds(conditioning)
     sampler = comfy.samplers.sampler_object(str(sampler_name))
-    sigmas = _sigmas(model, scheduler, steps, denoise)
+    if sigmas is None:
+        if int(steps) < 1:
+            raise ValueError("MiniMax H3 Extender: steps must be >= 1.")
+        sigmas = _sigmas(model, scheduler, steps, denoise)
 
     latent_out = latent.copy()
     latent_image = latent["samples"]
@@ -4140,6 +4188,13 @@ class MiniMaxH3Extender:
                     "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
                 },
             ),
+            # Keep SIGMAS physically last so older optional-input indexes remain stable.
+            "sigmas": (
+                "SIGMAS",
+                {
+                    "tooltip": "Optional external SIGMAS schedule. When connected, steps/scheduler are ignored; connect the matching patched MODEL upstream."
+                },
+            ),
         }
 
         return {
@@ -4210,11 +4265,14 @@ class MiniMaxH3Extender:
         resolution_mode,
         megapixels,
         export_profile,
+        sigmas=None,
     ):
         if fl2va_model is None:
             raise ValueError(
                 "MiniMax H3 Extender: FL2VA mode requires the fl2va_model input."
             )
+
+        sample_sigmas = _resolve_sample_sigmas(sigmas, denoise)
 
         clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
@@ -4501,6 +4559,7 @@ class MiniMaxH3Extender:
             sampled = _sample_h3(
                 clip_model, positive, latent, cfg["seed"],
                 str(sampler_name), str(scheduler), int(steps), float(denoise),
+                sigmas=sample_sigmas,
             )
             (
                 previous_handle,
@@ -4744,6 +4803,8 @@ class MiniMaxH3Extender:
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
         motion_context = bool(motion_context)
+        external_sigmas = kwargs.get("sigmas")
+        sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -4782,6 +4843,7 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
                 export_profile=requested_export_profile,
+                sigmas=external_sigmas,
             )
 
         if not motion_context:
@@ -4797,6 +4859,7 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode, megapixels=megapixels,
                 refs_json=refs_json, ref_pack=ref_pack,
                 export_profile=requested_export_profile, kwargs=kwargs,
+                sigmas=external_sigmas,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -5279,6 +5342,7 @@ class MiniMaxH3Extender:
                 str(scheduler),
                 int(steps),
                 float(denoise),
+                sigmas=sample_sigmas,
             )
 
             result = disk_join.join(

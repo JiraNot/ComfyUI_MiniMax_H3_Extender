@@ -6,6 +6,23 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+## 🆕 v2.9.0 — Continue an Existing Video
+
+MiniMax H3 Extender can now continue from an existing video.
+
+- Connect a video to the new optional `continue_existing_video` input.
+- The source becomes a locked **Clip 0** and is automatically included at the beginning of the preview and final export.
+- Clip 0 can be resized directly from its card using **Original**, **Auto / MP**, or **Manual** working resolution.
+- The source video is normalized to the Extender working format without modifying the original file.
+- The final frames of Clip 0 are used as the visual context for the first generated clip.
+- **Choose Ref** lets you pick any frame from the source video and use it as a normal `<Picture N>` reference, useful for preserving character identity when the end of the source video does not show the subject clearly.
+- Existing Motion Context behavior between generated clips remains unchanged.
+- Optional external `SIGMAS` support introduced in v2.8.5 is retained.
+
+This makes it possible to take an existing video and continue building it directly inside the Extender.
+
+---
+
 ## 🆕 v2.8.0 — Optional individual Full Batch clip export
 
 Full Batch can now optionally save each final clip as a separate video file using the new **Save Individual Clips** option in **Final Decode / Preview**.

@@ -349,6 +349,58 @@ function findInputEntry(node, name) {
     return null;
 }
 
+function projectContinueVideoDescriptor(projectPayload) {
+    const extender = projectPayload?.extender || {};
+    const settings = extender?.settings || {};
+    const raw = String(extender?.clips_json || settings?.clips_json || "");
+    if (!raw.trim()) return null;
+    return continueVideoDescriptor(parseState(raw));
+}
+
+function disconnectContinueVideoForProjectLoad(node, runtime) {
+    const entry = findInputEntry(node, "continue_existing_video");
+    if (!entry || !inputConnected(entry.input)) return false;
+
+    // A portable project's embedded Clip 0 is authoritative. Detach any old
+    // workflow VIDEO cable before hydrating the imported state so the next
+    // Queue cannot silently replace the restored source with the previously
+    // connected Load Video. Suppress the ordinary disconnect invalidation: the
+    // backend has just installed the imported project's cache and Clip 0.
+    runtime.suppressContinueVideoDisconnectClear = true;
+    runtime.continueVideoProbeEpoch = Number(runtime.continueVideoProbeEpoch || 0) + 1;
+    runtime.continueVideoProbeBusy = false;
+    runtime.continueVideoProbeKey = "";
+
+    let disconnected = false;
+    try {
+        if (typeof node.disconnectInput === "function") {
+            node.disconnectInput(entry.slot);
+            disconnected = !inputConnected(entry.input);
+        }
+        if (!disconnected && typeof node.graph?.removeLink === "function") {
+            const linkId = entry.input?.link;
+            if (linkId !== null && linkId !== undefined) node.graph.removeLink(linkId);
+            disconnected = !inputConnected(entry.input);
+        }
+    } catch (error) {
+        console.warn("[MiniMax H3 Extender] Failed to detach continue_existing_video while loading project", error);
+    }
+
+    if (!disconnected) {
+        runtime.suppressContinueVideoDisconnectClear = false;
+        return false;
+    }
+
+    runtime.continueVideoSocketConnected = false;
+    // onConnectionsChange defers refreshContinueVideoSocketState() with a zero
+    // timeout. Keep the guard alive long enough for that callback, but never let
+    // a missed callback suppress a later real user disconnect.
+    setTimeout(() => {
+        runtime.suppressContinueVideoDisconnectClear = false;
+    }, 100);
+    return true;
+}
+
 function addDynamicRefInput(node, name, type, tooltip = "") {
     if (!node || findInputEntry(node, name)) return false;
     try {
@@ -3458,6 +3510,12 @@ function refreshContinueVideoSocketState(node, runtime) {
     runtime.continueVideoSocketConnected = connected;
     if (!connected) {
         runtime.continueVideoProbeEpoch = Number(runtime.continueVideoProbeEpoch || 0) + 1;
+        if (runtime.suppressContinueVideoDisconnectClear) {
+            runtime.suppressContinueVideoDisconnectClear = false;
+            runtime.continueVideoSocketConnected = false;
+            runtime.continueVideoProbeKey = "";
+            return;
+        }
         if (wasConnected || activeContinueVideoDescriptor(runtime)) {
             void clearContinueVideoAfterDisconnect(node, runtime);
         }
@@ -4922,7 +4980,13 @@ async function loadProjectFile(node, runtime, file) {
             throw new Error(payload?.error || `Load Project failed (${response.status}).`);
         }
 
+        const loadedProjectClip0 = projectContinueVideoDescriptor(payload.project || {});
+        const detachedExternalClip0 = Boolean(loadedProjectClip0)
+            && disconnectContinueVideoForProjectLoad(node, runtime);
+
         applyProjectPayload(node, runtime, payload.project || {});
+        runtime.continueVideoPreviewMeta = loadedProjectClip0;
+        runtime.continueVideoWorkingMeta = null;
         runtime.cachedCount = Number(payload?.cache?.cached_count || 0);
         runtime.validatedCount = Number(payload?.cache?.validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload?.cache?.cached_clip_ids) ? payload.cache.cached_clip_ids.map(String) : []);
@@ -4964,7 +5028,8 @@ async function loadProjectFile(node, runtime, file) {
         const resolutionText = loadedW > 0 && loadedH > 0 ? ` | ${loadedW}x${loadedH}` : "";
         runtime.statusText =
             `Loaded ${runtime.projectName}${resolutionText} | refs ${refCount(runtime)} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
-            `validated ${runtime.validatedCount}`;
+            `validated ${runtime.validatedCount}` +
+            (detachedExternalClip0 ? " | project Clip 0 restored; external VIDEO disconnected" : "");
         render(node, runtime);
         syncDomHeight(node, runtime, false);
 
@@ -7243,6 +7308,7 @@ function buildUi(node) {
         continueVideoProbeKey: "",
         continueVideoProbeEpoch: 0,
         continueVideoProbeBusy: false,
+        suppressContinueVideoDisconnectClear: false,
         projectOperationBusy: false,
         projectName: String(node?.properties?.h3_project_name || ""),
         domWidget: null,

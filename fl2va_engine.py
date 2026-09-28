@@ -870,14 +870,23 @@ def _visible_frames_for_plan(data_path: Path, desc: dict, *, handoff_enabled: bo
 
 
 def _timeline_segments(data_path: Path, segments):
-    """Return descriptor copies using the visible prefix selected by Prev links."""
+    """Return descriptor copies using the visible prefix selected by Prev links.
+
+    A Clip 0 continuation may already expose only a suffix of the sampled first
+    plan through ``visible_offset`` while retaining the full latent decode size
+    in ``source_frames``. Preserve that geometry when FL2VA applies an optional
+    Previous-handoff trim on top of it.
+    """
     out = []
     for i, raw in enumerate(segments):
         desc = dict(raw)
+        source_frames = int(desc.get("source_frames", desc.get("frames", 0)) or 0)
+        visible_offset = int(desc.get("visible_offset", 0) or 0)
         visible = _visible_frames_for_plan(
             data_path, desc, handoff_enabled=_next_uses_previous(segments, i)
         )
-        desc["source_frames"] = int(desc.get("frames", 0))
+        desc["source_frames"] = int(source_frames)
+        desc["visible_offset"] = int(visible_offset)
         desc["frames"] = int(visible)
         desc["trim_frames"] = 0
         out.append(desc)
@@ -1392,7 +1401,7 @@ def cached_fl2va_ids(manifest) -> set[str]:
     }
 
 
-def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None, computed=False, generation_seed=None):
+def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None, computed=False, generation_seed=None, first_visible_offset=0):
     """Append a new latent blob and atomically replace/insert one logical plan."""
     from .motion_context_disk import (
         _append_segment,
@@ -1426,6 +1435,18 @@ def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, v
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0
+    if clip_index == 0 and int(first_visible_offset or 0) > 0:
+        visible_offset = int(first_visible_offset)
+        source_frames = int(desc.get("frames", 0) or 0)
+        if visible_offset < 0 or visible_offset >= source_frames:
+            raise ValueError(
+                "MiniMax H3 Extender: invalid Clip 0 continuation visible offset "
+                f"{visible_offset}/{source_frames}."
+            )
+        desc["source_frames"] = int(source_frames)
+        desc["visible_offset"] = int(visible_offset)
+        desc["frames"] = int(source_frames - visible_offset)
+        desc["continued_from_source"] = True
     if bool(computed) and not bool(validated):
         desc["computed"] = True
     dependency_meta = dependency_meta if isinstance(dependency_meta, dict) else {}
@@ -1601,9 +1622,11 @@ def export_fl2va_final(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     effective_mode = str(cache.get("run_mode", "full_batch")) if isinstance(cache, dict) else "full_batch"
+    source_meta = d._source_meta(manifest)
+    source_frames = d._source_frame_count(source_meta) if source_meta is not None else 0
     timeline_segments = _timeline_segments(data_path, segments)
-    expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
-    color_timeline = d._color_timeline(timeline_segments, float(fps))
+    expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments) + int(source_frames)
+    color_timeline = d._color_timeline(timeline_segments, float(fps), source_frames=source_frames)
 
     # ------------------------------------------------------------------
     # Clip by Clip: decoded plans are independent primary preview caches.
@@ -1614,7 +1637,12 @@ def export_fl2va_final(
             "codec": codec, "crf": crf, "preset": preset,
         })
 
-        video_inputs = []
+        token = f"fl2va_live_{os.urandom(5).hex()}"
+        source_preview_path = (
+            d._ensure_source_preview_video(data_path, manifest, ffmpeg, token)
+            if source_meta is not None else None
+        )
+        video_inputs = [source_preview_path] if source_preview_path is not None else []
         for i, desc in enumerate(segments):
             handoff_enabled = _next_uses_previous(segments, i)
             adjustment = d._normalize_color_adjustment(desc.get("color_adjustment"))
@@ -1682,9 +1710,9 @@ def export_fl2va_final(
             selected_clip_ids=selected_clip_ids if interrupted else None,
         )
         timeline_segments = _timeline_segments(data_path, segments)
-        expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
-        color_timeline = d._color_timeline(timeline_segments, float(fps))
-        timeline_signature = _timeline_signature(data_path, segments)
+        expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments) + int(source_frames)
+        color_timeline = d._color_timeline(timeline_segments, float(fps), source_frames=source_frames)
+        timeline_signature = _timeline_signature(data_path, segments) + f":source:{str((source_meta or {}).get('id') or '')}"
 
         committed_path = d._decoded_preview_cache_path(data_path)
         committed_count = int(manifest.get("preview_committed_count", 0) or 0)
@@ -1697,7 +1725,6 @@ def export_fl2va_final(
             or committed_signature != timeline_signature
         )
         if needs_assemble:
-            token = f"fl2va_live_{os.urandom(5).hex()}"
             d._assemble_progressive_preview(
                 ffmpeg,
                 video_inputs,
@@ -1707,6 +1734,7 @@ def export_fl2va_final(
                 float(fps),
                 committed_path,
                 token,
+                source_meta=source_meta,
             )
             manifest = dict(manifest)
             manifest["preview_committed_count"] = len(segments)
@@ -1765,7 +1793,12 @@ def export_fl2va_final(
         manifest_path, manifest, requested_profile, context="FL2VA Final Decode"
     )
 
-    video_inputs = []
+    token = f"fl2va_full_exact_{os.urandom(5).hex()}"
+    source_preview_path = (
+        d._ensure_source_preview_video(data_path, manifest, ffmpeg, token)
+        if source_meta is not None else None
+    )
+    video_inputs = [source_preview_path] if source_preview_path is not None else []
     exact_segment_paths = []
     for i, desc in enumerate(segments):
         handoff_enabled = _next_uses_previous(segments, i)
@@ -1830,7 +1863,10 @@ def export_fl2va_final(
     if interrupted:
         segments = segments[:snapshot_count]
         exact_segment_paths = exact_segment_paths[:snapshot_count]
-        video_inputs = video_inputs[:snapshot_count]
+        # video_inputs contains the optional Clip 0 working video before the
+        # generated plan videos. Keep that prefix plus every retained plan.
+        video_input_count = int(snapshot_count) + (1 if source_preview_path is not None else 0)
+        video_inputs = video_inputs[:video_input_count]
         selected_clip_ids = [
             str(x.get("clip_id") or "") for x in segments if str(x.get("clip_id") or "")
         ]
@@ -1849,9 +1885,9 @@ def export_fl2va_final(
     else:
         segments = [dict(x) for x in manifest.get("segments", [])]
     timeline_segments = _timeline_segments(data_path, segments)
-    expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
-    color_timeline = d._color_timeline(timeline_segments, float(fps))
-    timeline_signature = _timeline_signature(data_path, segments)
+    expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments) + int(source_frames)
+    color_timeline = d._color_timeline(timeline_segments, float(fps), source_frames=source_frames)
+    timeline_signature = _timeline_signature(data_path, segments) + f":source:{str((source_meta or {}).get('id') or '')}"
 
     committed_path = d._decoded_preview_cache_path(data_path)
     committed_count = int(manifest.get("preview_committed_count", 0) or 0)
@@ -1863,7 +1899,6 @@ def export_fl2va_final(
         or committed_mode != d.PREVIEW_AUDIO_MODE
         or committed_signature != timeline_signature
     )
-    token = f"fl2va_full_exact_{os.urandom(5).hex()}"
     if needs_assemble:
         d._assemble_progressive_preview(
             ffmpeg,
@@ -1874,6 +1909,7 @@ def export_fl2va_final(
             float(fps),
             committed_path,
             token,
+            source_meta=source_meta,
         )
         manifest = dict(manifest)
         manifest["preview_committed_count"] = len(segments)
@@ -1886,6 +1922,10 @@ def export_fl2va_final(
     preview_path = d._publish_full_preview(committed_path, unique_id)
     extension = d._full_batch_export_profile_extension(export_profile)
     output_path = d._next_output_path(out_dir, filename_prefix, extension)
+    source_final_segment = (
+        d._ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token)
+        if source_meta is not None else None
+    )
     final_video_mode, individual_export_info = d._export_final_from_exact_segment_caches(
         ffmpeg=ffmpeg,
         segment_paths=exact_segment_paths,
@@ -1900,6 +1940,8 @@ def export_fl2va_final(
         workflow=workflow,
         prompt=prompt,
         progress=progress,
+        source_meta=source_meta,
+        source_segment_path=source_final_segment,
     )
 
     d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)

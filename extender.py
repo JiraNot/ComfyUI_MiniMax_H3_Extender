@@ -103,7 +103,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.8.5"
+BUILD = "minimax-h3-extender-v2.9.0"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -116,6 +116,10 @@ MAX_STANDALONE_AUDIO_REFS = 3
 MAX_REF_VIDEO_FRAMES = 362
 MAX_MIXED_REF_ITEMS = 12
 MIN_REF_AUDIO_SECONDS = 2.0
+
+# Small metadata cache for native ComfyUI VIDEO inputs. It stores descriptors only,
+# never decoded frames or video bytes.
+_CONTINUE_VIDEO_INPUT_CACHE = {}
 
 
 class _LazyUnconnected:
@@ -150,7 +154,9 @@ MAX_IMAGE_REFS = MAX_REFERENCE_SLOTS
 REFS_JSON_VERSION = 2
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
 MAX_LOCAL_MEDIA_UPLOAD_BYTES = 512 * 1024 * 1024
+MAX_CONTINUE_VIDEO_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
 LOCAL_REFS_VERSION = 1
+CONTINUE_VIDEO_VERSION = 1
 MAX_REF_PIXELS = 120_000_000
 _PROJECT_DOWNLOADS = {}
 
@@ -349,6 +355,10 @@ def _normalize_media_descriptor(value, expected_kind=None):
         fps = max(0.0, float(value.get("fps", 0.0) or 0.0))
     except Exception:
         fps = 0.0
+    try:
+        frame_count = max(0, int(value.get("frame_count", 0) or 0))
+    except Exception:
+        frame_count = 0
     return {
         "id": media_id,
         "kind": kind,
@@ -358,7 +368,10 @@ def _normalize_media_descriptor(value, expected_kind=None):
         "width": width,
         "height": height,
         "fps": fps,
+        "frame_count": frame_count,
         "has_audio": bool(value.get("has_audio", False)),
+        "video_codec": str(value.get("video_codec") or ""),
+        "audio_codec": str(value.get("audio_codec") or ""),
     }
 
 
@@ -415,6 +428,8 @@ def _probe_media_file(path, kind):
 
     width = height = 0
     fps = 0.0
+    video_codec = ""
+    audio_codec = ""
     if video_lines:
         vline = video_lines[0]
         dims = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", vline)
@@ -423,25 +438,37 @@ def _probe_media_file(path, kind):
         fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", vline)
         if fps_match:
             fps = float(fps_match.group(1))
+        codec_match = re.search(r"Video:\s*([^,\s]+)", vline)
+        if codec_match:
+            video_codec = str(codec_match.group(1) or "").strip()
+    if audio_lines:
+        codec_match = re.search(r"Audio:\s*([^,\s]+)", audio_lines[0])
+        if codec_match:
+            audio_codec = str(codec_match.group(1) or "").strip()
+    frame_count = int(round(duration * fps)) if duration > 0.0 and fps > 0.0 else 0
     return {
         "duration": max(0.0, float(duration)),
         "width": max(0, int(width)),
         "height": max(0, int(height)),
         "fps": max(0.0, float(fps)),
+        "frame_count": max(0, int(frame_count)),
         "has_audio": bool(audio_lines),
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
     }
 
 
-def _store_uploaded_media(source_path, original_name, kind):
+def _store_uploaded_media(source_path, original_name, kind, min_duration=MIN_REF_AUDIO_SECONDS):
     source_path = Path(source_path)
     kind = str(kind).lower().strip()
     if kind not in {"video", "audio"}:
         raise ValueError("MiniMax H3 Extender: local media kind must be video or audio.")
     meta = _probe_media_file(source_path, kind)
-    if float(meta.get("duration", 0.0) or 0.0) > 0.0 and float(meta["duration"]) + 1e-6 < MIN_REF_AUDIO_SECONDS:
+    minimum = max(0.0, float(min_duration or 0.0))
+    if float(meta.get("duration", 0.0) or 0.0) > 0.0 and float(meta["duration"]) + 1e-6 < minimum:
         raise ValueError(
             f"MiniMax H3 Extender: local {kind} reference is only {float(meta['duration']):.3f}s; "
-            f"MiniMax H3 references require at least {MIN_REF_AUDIO_SECONDS:.0f}s."
+            f"this input requires at least {minimum:.0f}s."
         )
     media_id = _hash_file(source_path)
     target = _local_media_path(media_id)
@@ -459,6 +486,617 @@ def _store_uploaded_media(source_path, original_name, kind):
         "size_bytes": int(target.stat().st_size),
         **meta,
     }
+
+
+def _continue_video_from_native_input(video):
+    """Convert a native ComfyUI VIDEO input into the persistent Clip 0 descriptor.
+
+    The intended upstream is ComfyUI's native Load Video node. VideoFromFile
+    exposes its underlying path through get_stream_source(), so the Extender can
+    hash/copy/normalize it strictly disk-to-disk without decoding the complete
+    source into RAM. Tensor-backed VIDEO objects are rejected because materializing
+    them would defeat the memory invariant of Continue Existing Video.
+    """
+    if video is None:
+        return None
+    getter = getattr(video, "get_stream_source", None)
+    if not callable(getter):
+        raise ValueError(
+            "MiniMax H3 Extender: continue_existing_video must be a native file-backed VIDEO input "
+            "(for example ComfyUI Load Video)."
+        )
+    source = getter()
+    if not isinstance(source, (str, os.PathLike)):
+        raise ValueError(
+            "MiniMax H3 Extender: continue_existing_video must be file-backed. "
+            "Use ComfyUI Load Video so the source can stay on disk instead of being materialized in RAM."
+        )
+    source_path = Path(source)
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(
+            f"MiniMax H3 Extender: continue_existing_video source is missing: {source_path}"
+        )
+    stat = source_path.stat()
+    cache_key = (str(source_path.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _CONTINUE_VIDEO_INPUT_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        normalized = _normalize_media_descriptor(cached, "video")
+        if normalized is not None and _local_media_path(normalized["id"]).exists():
+            return normalized
+
+    descriptor = _store_uploaded_media(
+        source_path, source_path.name or "continue_existing_video.mp4", "video", 0.0
+    )
+    _validate_continue_source_file_geometry(descriptor)
+    _CONTINUE_VIDEO_INPUT_CACHE.clear()
+    _CONTINUE_VIDEO_INPUT_CACHE[cache_key] = dict(descriptor)
+    return descriptor
+
+
+def _resolve_continue_video_selected_file(file_value):
+    """Resolve one native Load Video selection inside ComfyUI's input tree."""
+    selected = str(file_value or "").strip()
+    if not selected:
+        raise ValueError("MiniMax H3 Extender: Load Video has no selected file.")
+
+    source_path = Path(folder_paths.get_annotated_filepath(selected))
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(
+            f"MiniMax H3 Extender: continue_existing_video source is missing: {source_path}"
+        )
+
+    # Native Load Video exposes files from ComfyUI's input directory. Refuse a
+    # crafted annotated path outside that tree. This resolver is also reused by
+    # the Clip 0 frame picker, which streams the source file to the browser.
+    input_root = Path(folder_paths.get_input_directory()).resolve()
+    resolved = source_path.resolve()
+    try:
+        common = Path(os.path.commonpath([str(input_root), str(resolved)]))
+    except Exception as exc:
+        raise ValueError("MiniMax H3 Extender: invalid Load Video source path.") from exc
+    if os.path.normcase(str(common)) != os.path.normcase(str(input_root)):
+        raise ValueError("MiniMax H3 Extender: Load Video source must be inside ComfyUI input directory.")
+    return resolved
+
+
+def _probe_continue_video_file(file_value):
+    """Probe a native Load Video selection for the frontend Clip 0 card.
+
+    This is metadata-only: it never copies, decodes, normalizes, or stores the
+    source. The real VIDEO object is still consumed on Queue by
+    ``_continue_video_from_native_input``. Keeping the probe side-effect free
+    means merely connecting a video cannot duplicate a multi-gigabyte source.
+    """
+    resolved = _resolve_continue_video_selected_file(file_value)
+
+    meta = _probe_media_file(resolved, "video")
+    stat = resolved.stat()
+    # The id is only a lightweight frontend probe identity. It is intentionally
+    # not the content hash used by the persistent media store, so probing does
+    # not require reading the whole file. The descriptor never enters project
+    # state until the real VIDEO input executes.
+    probe_key = f"{resolved}\0{int(stat.st_size)}\0{int(stat.st_mtime_ns)}"
+    probe_id = hashlib.sha256(probe_key.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return {
+        "id": probe_id,
+        "kind": "video",
+        "original_name": resolved.name or "continue_existing_video.mp4",
+        "size_bytes": int(stat.st_size),
+        **meta,
+    }
+
+
+def _continue_video_from_state(value):
+    """Return the optional non-generative Clip 0 video descriptor from clips_json."""
+    if isinstance(value, dict):
+        payload = value
+    else:
+        try:
+            payload = json.loads(str(value or "{}"))
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("continue_existing_video")
+    desc = _normalize_media_descriptor(raw, "video")
+    if desc is None:
+        return None
+    desc["version"] = int(CONTINUE_VIDEO_VERSION)
+    return desc
+
+
+def _continue_resize_from_state(value):
+    """Return Clip 0 working-resolution settings without adding a new ComfyUI socket."""
+    if isinstance(value, dict):
+        payload = value
+    else:
+        try:
+            payload = json.loads(str(value or "{}"))
+        except Exception:
+            payload = {}
+    raw = payload.get("continue_video_resize") if isinstance(payload, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    mode = str(raw.get("mode") or "original").strip().lower()
+    if mode not in {"original", "auto", "manual"}:
+        mode = "original"
+    try:
+        mp = max(0.01, min(16.0, float(raw.get("megapixels", DEFAULT_MEGAPIXELS))))
+    except Exception:
+        mp = float(DEFAULT_MEGAPIXELS)
+    try:
+        width = int(raw.get("width", 896) or 896)
+    except Exception:
+        width = 896
+    try:
+        height = int(raw.get("height", 576) or 576)
+    except Exception:
+        height = 576
+    return {
+        "mode": mode,
+        "megapixels": mp,
+        "width": width,
+        "height": height,
+    }
+
+
+def _continue_target_resolution(desc, resize):
+    """Resolve Clip 0's disk working size from source metadata and card settings."""
+    source_width, source_height = _validate_continue_source_file_geometry(desc)
+    settings = resize if isinstance(resize, dict) else {}
+    mode = str(settings.get("mode") or "original").lower()
+    if mode == "auto":
+        width, height = _auto_resolution_from_dimensions(
+            source_width,
+            source_height,
+            float(settings.get("megapixels", DEFAULT_MEGAPIXELS)),
+        )
+    elif mode == "manual":
+        width, height = _manual_effective_resolution(
+            int(settings.get("width", 896) or 896),
+            int(settings.get("height", 576) or 576),
+        )
+    else:
+        mode = "original"
+        width, height = source_width, source_height
+    _validate_continue_working_geometry(width, height, mode=mode)
+    return int(width), int(height), mode
+
+
+def _continue_source_working_path(data_path):
+    """Owner-local normalized Clip 0 cache used by Motion Context and Final Decode."""
+    return Path(data_path).with_suffix(".source.mkv")
+
+
+def _continue_source_preview_video_path(data_path):
+    return Path(data_path).with_suffix(".source.preview.video.mp4")
+
+
+def _clear_continue_source_derivatives(data_path, *, remove_working=True):
+    """Drop only derived Clip 0 files. The immutable uploaded source stays in local-media store."""
+    paths = [
+        _continue_source_preview_video_path(data_path),
+        Path(data_path).with_suffix(".preview.mp4"),
+        Path(data_path).with_suffix(".preview.video.mp4"),
+    ]
+    if remove_working:
+        paths.append(_continue_source_working_path(data_path))
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    final_dir = Path(data_path).with_suffix(".final.video")
+    if final_dir.exists():
+        try:
+            for child in final_dir.glob("source_*"):
+                if child.is_file():
+                    child.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _validate_continue_source_file_geometry(desc):
+    """Validate only the immutable source file geometry; resizing is allowed afterwards."""
+    width = int(desc.get("width", 0) or 0)
+    height = int(desc.get("height", 0) or 0)
+    if width < 2 or height < 2:
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 source has invalid dimensions {width}x{height}."
+        )
+    return width, height
+
+
+def _validate_continue_working_geometry(width, height, *, mode="manual"):
+    width = int(width)
+    height = int(height)
+    if width < 32 or height < 32:
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 working resolution is {width}x{height}; both dimensions must be at least 32 pixels."
+        )
+    if width > MAX_RESOLUTION or height > MAX_RESOLUTION:
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 working resolution is {width}x{height}; H3 supports at most "
+            f"{MAX_RESOLUTION}x{MAX_RESOLUTION}."
+        )
+    if (width % 16) or (height % 16):
+        hint = " Choose Auto / MP or Manual resize on the Clip 0 card." if str(mode) == "original" else ""
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 working resolution {width}x{height} is not compatible with "
+            f"the H3 VideoVAE geometry; both dimensions must be divisible by 16.{hint}"
+        )
+    return width, height
+
+
+def _validate_continue_source_geometry(desc):
+    """Backward-compatible validator for an already-normalized Clip 0 descriptor."""
+    width = int(desc.get("width", 0) or 0)
+    height = int(desc.get("height", 0) or 0)
+    return _validate_continue_working_geometry(width, height, mode=str(desc.get("resize_mode") or "manual"))
+
+
+def _normalize_continue_source(data_path, desc, target_width, target_height, resize_mode="original"):
+    """Create the disk working copy at the selected size and 24 fps without loading the full source in RAM."""
+    desc = _normalize_media_descriptor(desc, "video")
+    if desc is None:
+        raise ValueError("MiniMax H3 Extender: invalid continue_existing_video descriptor.")
+    source_width, source_height = _validate_continue_source_file_geometry(desc)
+    width, height = _validate_continue_working_geometry(target_width, target_height, mode=resize_mode)
+    source_path = _local_media_path(desc["id"])
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"MiniMax H3 Extender: Clip 0 source '{desc['original_name']}' is missing from the internal media store."
+        )
+
+    working_path = _continue_source_working_path(data_path)
+    temp_path = working_path.with_name(working_path.name + f".{uuid.uuid4().hex}.tmp.mkv")
+    ffmpeg = _find_ffmpeg()
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(source_path),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", (
+            f"fps={FPS}"
+            if (source_width == width and source_height == height)
+            else f"scale={width}:{height}:flags=lanczos,fps={FPS}"
+        ),
+        # High-quality working copy. Resize + FPS normalization happen in this
+        # single disk-to-disk FFmpeg pass; the immutable source stays untouched.
+        # original uploaded file remains untouched and is never kept in RAM.
+        "-c:v", "libx264", "-preset", "fast", "-crf", "10", "-pix_fmt", "yuv420p",
+        "-c:a", "flac", "-ac", "2", "-ar", "48000",
+        str(temp_path),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size <= 0:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-4000:]
+        temp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"MiniMax H3 Extender: failed to normalize Clip 0 to {FPS} fps. {detail}"
+        )
+    meta = _probe_media_file(temp_path, "video")
+    if int(meta.get("width", 0)) != width or int(meta.get("height", 0)) != height:
+        temp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "MiniMax H3 Extender: Clip 0 working-copy resolution mismatch "
+            f"({width}x{height} requested -> {meta.get('width')}x{meta.get('height')})."
+        )
+    if abs(float(meta.get("fps", 0.0) or 0.0) - float(FPS)) > 0.05:
+        temp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"MiniMax H3 Extender: normalized Clip 0 reports {meta.get('fps')} fps instead of {FPS}."
+        )
+    os.replace(temp_path, working_path)
+    normalized_frames = int(round(float(meta.get("duration", 0.0) or 0.0) * float(FPS)))
+    if normalized_frames < 5:
+        working_path.unlink(missing_ok=True)
+        raise ValueError("MiniMax H3 Extender: Clip 0 is too short to provide H3 Motion Context.")
+    return {
+        "version": int(CONTINUE_VIDEO_VERSION),
+        "id": str(desc["id"]),
+        "original_name": str(desc.get("original_name") or "source video"),
+        "width": width,
+        "height": height,
+        "source_width": int(source_width),
+        "source_height": int(source_height),
+        "resize_mode": str(resize_mode or "original"),
+        "original_fps": float(desc.get("fps", 0.0) or 0.0),
+        "fps": float(FPS),
+        "duration": float(meta.get("duration", desc.get("duration", 0.0)) or 0.0),
+        "frame_count": int(normalized_frames),
+        "has_audio": bool(meta.get("has_audio", False)),
+        "video_codec": str(desc.get("video_codec") or meta.get("video_codec") or ""),
+        "audio_codec": str(desc.get("audio_codec") or meta.get("audio_codec") or ""),
+        "working_codec": str(meta.get("video_codec") or "h264"),
+    }
+
+
+
+def _prepare_continue_source_random_access(
+    data_path,
+    manifest_path,
+    manifest,
+    clips,
+    continue_existing_video,
+    continue_video_resize,
+    *,
+    sequence_mode,
+    owner,
+):
+    """Install/reuse Clip 0 for FL2VA or Ref2VA Motion OFF.
+
+    Random-access modes still share the same Clip 0 contract as causal Ref2VA:
+    one disk-backed 24-fps working copy, source geometry driving every generated
+    clip, and a full generated-cache reset whenever the source or its effective
+    working geometry changes. Only the generated cache is random-access; Clip 0
+    remains the immutable root of the assembled timeline.
+    """
+    manifest = dict(manifest or {})
+    previous_source = manifest.get("source_video") if isinstance(manifest.get("source_video"), dict) else None
+    wanted_source_id = str(continue_existing_video.get("id") or "") if continue_existing_video is not None else ""
+    previous_source_id = str(previous_source.get("id") or "") if previous_source is not None else ""
+
+    target_width = target_height = 0
+    target_resize_mode = "original"
+    if continue_existing_video is not None:
+        target_width, target_height, target_resize_mode = _continue_target_resolution(
+            continue_existing_video,
+            continue_video_resize,
+        )
+
+    source_changed = wanted_source_id != previous_source_id
+    working_geometry_changed = bool(
+        continue_existing_video is not None
+        and previous_source is not None
+        and (
+            int(previous_source.get("width", 0) or 0) != int(target_width)
+            or int(previous_source.get("height", 0) or 0) != int(target_height)
+        )
+    )
+    source_working_changed = bool(source_changed or working_geometry_changed)
+
+    if source_working_changed:
+        if manifest.get("segments"):
+            manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+        # Both random-access engines use this sidecar directory for decoded
+        # per-plan video/final caches. A changed Clip 0 invalidates every clip.
+        try:
+            shutil.rmtree(Path(data_path).with_suffix(".fl2va.video"), ignore_errors=True)
+        except Exception:
+            pass
+        _clear_continue_source_derivatives(data_path, remove_working=True)
+        manifest = dict(manifest)
+        manifest.pop("source_video", None)
+        manifest["sequence_mode"] = str(sequence_mode)
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
+        for cfg in clips:
+            cfg["validated"] = False
+
+    source_meta = None
+    if continue_existing_video is not None:
+        working_source = _continue_source_working_path(data_path)
+        if (
+            not source_working_changed
+            and previous_source is not None
+            and working_source.exists()
+            and str(previous_source.get("id") or "") == wanted_source_id
+        ):
+            source_meta = dict(previous_source)
+            source_meta["resize_mode"] = str(target_resize_mode)
+            source_meta["source_width"] = int(
+                continue_existing_video.get("width", 0)
+                or source_meta.get("source_width", 0)
+                or 0
+            )
+            source_meta["source_height"] = int(
+                continue_existing_video.get("height", 0)
+                or source_meta.get("source_height", 0)
+                or 0
+            )
+            _validate_continue_source_geometry(source_meta)
+        else:
+            _send_extender_progress(
+                owner,
+                -1,
+                len(clips),
+                "preparing",
+                f"Preparing Clip 0 {target_width}x{target_height} @ {FPS} fps",
+            )
+            source_meta = _normalize_continue_source(
+                data_path,
+                continue_existing_video,
+                target_width,
+                target_height,
+                target_resize_mode,
+            )
+        manifest = dict(manifest)
+        manifest["source_video"] = dict(source_meta)
+        manifest["sequence_mode"] = str(sequence_mode)
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
+
+    if source_meta is not None:
+        working_width, working_height = _validate_continue_source_geometry(source_meta)
+        requested_resolution = {
+            "width": int(working_width),
+            "height": int(working_height),
+            "mode": "source_video",
+            "source_resize_mode": str(target_resize_mode),
+            "guide_ref": None,
+            "guide_src_width": int(continue_existing_video.get("width", 0) or 0),
+            "guide_src_height": int(continue_existing_video.get("height", 0) or 0),
+            "fallback": False,
+            "megapixels": float(working_width * working_height) / 1_000_000.0,
+        }
+    else:
+        requested_resolution = None
+
+    return manifest, source_meta, requested_resolution, str(target_resize_mode), source_working_changed
+
+
+def _decode_continue_tail_frames(working_path, width, height, frame_count):
+    """Decode only the small final RGB window needed by VideoVAE."""
+    frame_count = int(frame_count)
+    seconds = max(0.25, (frame_count + 3) / float(FPS))
+    ffmpeg = _find_ffmpeg()
+    cmd = [
+        ffmpeg, "-v", "error", "-sseof", f"-{seconds:.9f}", "-i", str(working_path),
+        "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-3000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode Clip 0 tail. {detail}")
+    frame_bytes = int(width) * int(height) * 3
+    count = len(proc.stdout) // frame_bytes
+    if count < frame_count:
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 contains only {count} decodable tail frames; "
+            f"Motion Context is set to {frame_count} frames."
+        )
+    raw = np.frombuffer(proc.stdout[(count - frame_count) * frame_bytes:count * frame_bytes], dtype=np.uint8)
+    raw = raw.reshape(frame_count, int(height), int(width), 3).copy()
+    return torch.from_numpy(raw).float().div_(255.0)
+
+
+def _decode_continue_tail_audio(working_path, audio_frames, audio_vae):
+    """Decode only the requested final audio window, then AudioVAE-encode it."""
+    audio_frames = max(1, int(audio_frames))
+    vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
+    seconds = max(0.05, audio_frames / float(FPS))
+    ffmpeg = _find_ffmpeg()
+    cmd = [
+        ffmpeg, "-v", "error", "-sseof", f"-{seconds:.9f}", "-i", str(working_path),
+        "-vn", "-ac", "2", "-ar", str(vae_sr), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-3000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode Clip 0 audio tail. {detail}")
+    arr = np.frombuffer(proc.stdout, dtype=np.float32)
+    wanted = max(1, int(round(seconds * vae_sr)))
+    if arr.size >= 2:
+        arr = arr[: (arr.size // 2) * 2].reshape(-1, 2)
+    else:
+        arr = np.zeros((0, 2), dtype=np.float32)
+    if arr.shape[0] > wanted:
+        arr = arr[-wanted:]
+    elif arr.shape[0] < wanted:
+        pad = np.zeros((wanted - arr.shape[0], 2), dtype=np.float32)
+        arr = np.concatenate((pad, arr), axis=0)
+    waveform = torch.from_numpy(np.ascontiguousarray(arr.T)).unsqueeze(0)
+    return audio_vae.encode(waveform.movedim(1, -1))
+
+
+def _build_continue_context_latent(vae, audio_vae, data_path, source_meta, context_frames, audio_context_frames):
+    """Build Clip 0 bootstrap data for the first generated clip.
+
+    The requested RGB tail is VideoVAE-encoded once and returned separately as
+    one native H3 head-guide latent. A synthetic joint AV latent is still built
+    only to reuse the existing end-aligned audio Motion Context calculation.
+    A longer audio context therefore never forces the same amount of RGB video
+    into RAM.
+    """
+    working_path = _continue_source_working_path(data_path)
+    if not working_path.exists():
+        raise FileNotFoundError("MiniMax H3 Extender: normalized Clip 0 cache is missing.")
+    width = int(source_meta["width"])
+    height = int(source_meta["height"])
+    context_frames = int(context_frames)
+    total_source_frames = int(source_meta.get("frame_count", 0) or 0)
+    if total_source_frames < context_frames:
+        raise ValueError(
+            f"MiniMax H3 Extender: Clip 0 has {total_source_frames} frames at {FPS} fps, "
+            f"but context_length requires {context_frames}."
+        )
+
+    frames = _decode_continue_tail_frames(working_path, width, height, context_frames)
+    video_tail = vae.encode(frames)
+    del frames
+    if video_tail.ndim == 4:
+        video_tail = video_tail.unsqueeze(0)
+    expected_t = _video_latent_t(context_frames)
+    if video_tail.ndim != 5 or int(video_tail.shape[2]) != int(expected_t):
+        raise RuntimeError(
+            "MiniMax H3 Extender: VideoVAE Clip 0 tail geometry is incompatible with Motion Context "
+            f"(got {tuple(video_tail.shape)}, expected temporal T={expected_t})."
+        )
+
+    audio_frames = int(audio_context_frames) or int(context_frames)
+    audio_frames = max(1, min(audio_frames, total_source_frames))
+    audio_tail = None
+    if bool(source_meta.get("has_audio", False)) and audio_vae is not None:
+        audio_tail = _decode_continue_tail_audio(working_path, audio_frames, audio_vae)
+        if audio_tail.ndim == 3:
+            audio_tail = audio_tail.unsqueeze(0)
+
+    synthetic_frames = _align_frame_count(max(context_frames, audio_frames))
+    synthetic_video_t = _video_latent_t(synthetic_frames)
+    synthetic_audio_t = int(round(synthetic_frames / float(FPS) * AUDIO_LATENT_FPS))
+    if audio_tail is not None:
+        while int(audio_tail.shape[-1]) > synthetic_audio_t:
+            synthetic_frames += 17
+            synthetic_video_t = _video_latent_t(synthetic_frames)
+            synthetic_audio_t = int(round(synthetic_frames / float(FPS) * AUDIO_LATENT_FPS))
+
+    video = torch.zeros(
+        (int(video_tail.shape[0]), int(video_tail.shape[1]), int(synthetic_video_t), int(video_tail.shape[3]), int(video_tail.shape[4])),
+        device=video_tail.device,
+        dtype=video_tail.dtype,
+    )
+    video[:, :, -int(video_tail.shape[2]):] = video_tail
+    audio = torch.zeros(
+        (1, 32, 2, int(synthetic_audio_t)),
+        device=video_tail.device,
+        dtype=video_tail.dtype,
+    )
+    if audio_tail is not None:
+        audio_tail = audio_tail.to(device=audio.device, dtype=audio.dtype)
+        audio[..., -int(audio_tail.shape[-1]):] = audio_tail
+    guide_latent = video_tail
+    del audio_tail
+    return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, guide_latent
+
+
+def _continue_head_guide_conditioning(base_conditioning, motion_conditioning, guide_latent):
+    """Replace Clip 0's synthetic per-token video Motion Context with one guide.
+
+    This mirrors the native MiniMaxH3AddGuide contract for a multi-frame image
+    batch anchored at frame 0: one VideoVAE latent under ``minimax_keyframes``.
+    Audio conditioning produced by Motion Context is preserved unchanged so its
+    tail remains end-aligned to the Clip 0 -> Clip 1 seam.
+    """
+    if guide_latent is None or getattr(guide_latent, "ndim", 0) != 5:
+        raise ValueError("MiniMax H3 Extender: Clip 0 head guide latent is invalid.")
+
+    out = []
+    for index, item in enumerate(motion_conditioning):
+        meta = dict(item[1])
+        base_meta = {}
+        if index < len(base_conditioning):
+            base_item = base_conditioning[index]
+            if isinstance(base_item, (list, tuple)) and len(base_item) > 1 and isinstance(base_item[1], dict):
+                base_meta = base_item[1]
+
+        # Motion Context's native path represents carried audio as an
+        # audio-only minimax_keyframe. Its compatibility path stores audio in
+        # minimax_refs instead, which is already present in ``meta`` and is
+        # therefore left untouched here.
+        audio_keyframes = []
+        for keyframe in meta.get("minimax_keyframes", []) or []:
+            if isinstance(keyframe, dict) and "audio_latent" in keyframe and "latent" not in keyframe:
+                audio_keyframes.append(keyframe)
+
+        keyframes = list(base_meta.get("minimax_keyframes", []) or [])
+        keyframes.append({
+            "resolved_frame_index": 0,
+            "latent": guide_latent,
+        })
+        keyframes.extend(audio_keyframes)
+        meta["minimax_keyframes"] = keyframes
+        out.append([item[0], meta])
+
+    return out
 
 
 def _load_local_audio_media(desc, cache=None):
@@ -2191,12 +2829,26 @@ def _prompt_pack_signature_from_state(value):
     return signature
 
 
-def _state_json(clips, prompt_pack_signature="", generation_mode=None, motion_context=None):
-    payload = {"version": 1, "clips": clips}
+def _state_json(
+    clips,
+    prompt_pack_signature="",
+    generation_mode=None,
+    motion_context=None,
+    continue_existing_video=None,
+    continue_video_resize=None,
+):
+    payload = {"version": 2, "clips": clips}
     if generation_mode is not None:
         payload["generation_mode"] = _normalize_generation_mode(generation_mode)
     if motion_context is not None:
         payload["motion_context"] = bool(motion_context)
+    source = _normalize_media_descriptor(continue_existing_video, "video")
+    if source is not None:
+        source["version"] = int(CONTINUE_VIDEO_VERSION)
+        payload["continue_existing_video"] = source
+    if isinstance(continue_video_resize, dict):
+        resize = _continue_resize_from_state({"continue_video_resize": continue_video_resize})
+        payload["continue_video_resize"] = resize
     signature = str(prompt_pack_signature or "").lower().strip()
     if len(signature) == 64 and all(ch in "0123456789abcdef" for ch in signature):
         payload["prompt_pack_signature"] = signature
@@ -2620,6 +3272,24 @@ def _prompt_pack_signature_from_project_payload(project_payload):
     return _prompt_pack_signature_from_state(raw)
 
 
+def _continue_video_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json") if isinstance(extender, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
+        raw = settings.get("clips_json") if isinstance(settings, dict) else None
+    return _continue_video_from_state(raw)
+
+
+def _continue_resize_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json") if isinstance(extender, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
+        raw = settings.get("clips_json") if isinstance(settings, dict) else None
+    return _continue_resize_from_state(raw)
+
+
 def _clips_from_project_payload(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
     generation_mode = _generation_mode_from_project_payload(project_payload)
@@ -2640,7 +3310,16 @@ def _write_clips_to_project_payload(project_payload, clips, generation_mode=None
     mode = _normalize_generation_mode(generation_mode or _generation_mode_from_project_payload(project_payload))
     motion_context = _motion_context_from_project_payload(project_payload)
     signature = _prompt_pack_signature_from_project_payload(project_payload)
-    raw = _state_json(clips, signature, mode, motion_context=motion_context)
+    project_continue_video = _continue_video_from_project_payload(project_payload)
+    raw = _state_json(
+        clips, signature, mode, motion_context=motion_context,
+        continue_existing_video=project_continue_video,
+        continue_video_resize=(
+            _continue_resize_from_project_payload(project_payload)
+            if project_continue_video is not None
+            else None
+        ),
+    )
     extender = project_payload.setdefault("extender", {})
     extender["generation_mode"] = mode
     extender["motion_context"] = bool(motion_context)
@@ -2812,7 +3491,11 @@ def _project_cache_snapshot(owner_id, project_payload):
             except Exception:
                 shown_clips = 0
                 shown_frames = 0
-            expected_frames = int(manifest.get("final_frame_count", 0) or 0)
+            source_meta = manifest.get("source_video") if isinstance(manifest.get("source_video"), dict) else None
+            source_frames = int(source_meta.get("frame_count", 0) or 0) if source_meta is not None else 0
+            if source_frames <= 0 and source_meta is not None:
+                source_frames = int(round(float(source_meta.get("duration", 0.0) or 0.0) * float(FPS)))
+            expected_frames = int(manifest.get("final_frame_count", 0) or 0) + max(0, int(source_frames))
             if shown_clips == len(segments) and shown_frames == expected_frames and shown_frames > 0:
                 candidate = _latest_preview_temp_path(final_id)
                 if candidate is not None and candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
@@ -2983,6 +3666,10 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
     local_media_files = []
     project_clips = _clips_from_project_payload(project_payload)
     local_image_refs, local_media_refs = _local_ref_assets_from_clips(project_clips)
+    continue_source_ref = _continue_video_from_project_payload(project_payload)
+    if continue_source_ref is not None:
+        local_media_refs = dict(local_media_refs)
+        local_media_refs[str(continue_source_ref["id"])] = continue_source_ref
     for ref_id in sorted(local_image_refs):
         path = _ref_path(ref_id)
         if not path.exists():
@@ -2997,7 +3684,12 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             raise FileNotFoundError(
                 f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
             )
-        if int(path.stat().st_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+        media_limit = (
+            MAX_CONTINUE_VIDEO_UPLOAD_BYTES
+            if continue_source_ref is not None and str(media_id) == str(continue_source_ref.get("id") or "")
+            else MAX_LOCAL_MEDIA_UPLOAD_BYTES
+        )
+        if int(path.stat().st_size) > int(media_limit):
             raise ValueError(
                 f"MiniMax H3 Extender Project: local media '{media['original_name']}' exceeds the portable-project size limit."
             )
@@ -3085,6 +3777,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "fl2va_original_sources": int(len(frame_source_files)),
             "local_images": int(len(local_image_files)),
             "local_media": int(len(local_media_files)),
+            "continue_existing_video": bool(continue_source_ref is not None),
         },
         "cache": {
             "present": snapshot is not None,
@@ -3363,6 +4056,10 @@ def _import_project_archive(owner_id, archive_path):
             # Restore local per-clip assets. Their ids are content hashes, so the
             # clip JSON stays stable across machines and no slot remapping occurs.
             local_image_refs, local_media_refs = _local_ref_assets_from_clips(clips)
+            continue_source_ref = _continue_video_from_project_payload(project_payload)
+            if continue_source_ref is not None:
+                local_media_refs = dict(local_media_refs)
+                local_media_refs[str(continue_source_ref["id"])] = continue_source_ref
             for ref_id in sorted(local_image_refs):
                 member = f"local_refs/images/{ref_id}.png"
                 if member not in names:
@@ -3387,7 +4084,12 @@ def _import_project_archive(owner_id, archive_path):
                         f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
                     )
                 info = zf.getinfo(member)
-                if int(info.file_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+                media_limit = (
+                    MAX_CONTINUE_VIDEO_UPLOAD_BYTES
+                    if continue_source_ref is not None and str(media_id) == str(continue_source_ref.get("id") or "")
+                    else MAX_LOCAL_MEDIA_UPLOAD_BYTES
+                )
+                if int(info.file_size) > int(media_limit):
                     raise ValueError("MiniMax H3 Extender Project: local media reference is unexpectedly large.")
                 temp_media = work_root / f"local_media_{media_id}.bin"
                 _zip_copy_member(zf, member, temp_media)
@@ -3738,7 +4440,16 @@ def _import_project_archive(owner_id, archive_path):
                         found_open = True
 
             normalized_clips_json = _state_json(
-                clips, project_prompt_pack_signature, generation_mode, motion_context=motion_context
+                clips,
+                project_prompt_pack_signature,
+                generation_mode,
+                motion_context=motion_context,
+                continue_existing_video=continue_source_ref,
+                continue_video_resize=(
+                    _continue_resize_from_project_payload(project_payload)
+                    if continue_source_ref is not None
+                    else None
+                ),
             )
             extender_payload = project_payload.setdefault("extender", {})
             extender_payload["generation_mode"] = generation_mode
@@ -4174,8 +4885,7 @@ class MiniMaxH3Extender:
                     "tooltip": "Optional soundtrack of ref_video_3.",
                 },
             ),
-            # Keep the two pack sockets visually last. The frontend also
-            # preserves this ordering when dynamic AV sockets grow/shrink.
+            # Keep the existing v2.8.5 optional-input order unchanged.
             "ref_pack": (
                 REF_PACK_TYPE,
                 {
@@ -4188,11 +4898,19 @@ class MiniMaxH3Extender:
                     "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
                 },
             ),
-            # Keep SIGMAS physically last so older optional-input indexes remain stable.
             "sigmas": (
                 "SIGMAS",
                 {
                     "tooltip": "Optional external SIGMAS schedule. When connected, steps/scheduler are ignored; connect the matching patched MODEL upstream."
+                },
+            ),
+            # v2.9.0 appends its new socket after every pre-existing optional input
+            # so saved v2.8.5 target_slot indexes remain unchanged.
+            "continue_existing_video": (
+                "VIDEO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional existing source video to continue as locked Clip 0. Use a native file-backed Load Video output; choose the working resize on the Clip 0 card.",
                 },
             ),
         }
@@ -4265,6 +4983,10 @@ class MiniMaxH3Extender:
         resolution_mode,
         megapixels,
         export_profile,
+        context_length,
+        audio_context_length,
+        continue_existing_video=None,
+        continue_video_resize=None,
         sigmas=None,
     ):
         if fl2va_model is None:
@@ -4276,10 +4998,22 @@ class MiniMaxH3Extender:
 
         clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+        manifest, source_meta, source_resolution, target_resize_mode, source_working_changed = (
+            _prepare_continue_source_random_access(
+                data_path,
+                manifest_path,
+                manifest,
+                clips,
+                continue_existing_video,
+                continue_video_resize,
+                sequence_mode="fl2va",
+                owner=owner,
+            )
+        )
 
         # FL2VA Auto resolution uses the first available card keyframe as its
-        # aspect-ratio guide. Internal Ref2VA references remain untouched and are
-        # simply irrelevant in this mode.
+        # aspect-ratio guide only when Clip 0 is absent. With Clip 0 connected,
+        # the card's working resize is the project geometry for every plan.
         frame_guides = []
         for cfg in clips:
             if cfg.get("first_frame") is not None:
@@ -4293,13 +5027,17 @@ class MiniMaxH3Extender:
                 )
                 if first_guide is not None:
                     frame_guides.append(first_guide)
-        requested_resolution = _resolve_generation_resolution(
-            resolution_mode, megapixels, width, height, frame_guides
+        requested_resolution = (
+            dict(source_resolution)
+            if source_resolution is not None
+            else _resolve_generation_resolution(
+                resolution_mode, megapixels, width, height, frame_guides
+            )
         )
         resolution = dict(requested_resolution)
         resolution["requested_width"] = int(requested_resolution["width"])
         resolution["requested_height"] = int(requested_resolution["height"])
-        resolution["cache_reset"] = False
+        resolution["cache_reset"] = bool(source_working_changed)
         resolved_width = int(resolution["width"])
         resolved_height = int(resolution["height"])
 
@@ -4322,7 +5060,12 @@ class MiniMaxH3Extender:
 
         if prompt_pack_imported and external_prompt_pack is not None:
             imported_json = _state_json(
-                clips, active_prompt_pack_signature, "fl2va"
+                clips,
+                active_prompt_pack_signature,
+                "fl2va",
+                motion_context=False,
+                continue_existing_video=continue_existing_video,
+                continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
             )
             _send_extender_prompt_pack_import(
                 owner,
@@ -4522,7 +5265,13 @@ class MiniMaxH3Extender:
             frame_count = _duration_to_frames(cfg["duration"])
             first_desc = cfg.get("first_frame")
             last_desc = cfg.get("last_frame")
-            if first_source == "manual":
+            if i == 0 and source_meta is not None:
+                # Clip 0 already defines the complete beginning of the first
+                # FL2VA plan through a multi-frame head guide. A manual First
+                # frame at index 0 would be a competing anchor, so it is ignored
+                # only for this first continued plan.
+                first_frame = None
+            elif first_source == "manual":
                 first_frame = _load_reference_tensor(first_desc) if first_desc is not None else None
             last_frame = _load_reference_tensor(last_desc) if last_desc is not None else None
             guide_frames = []
@@ -4552,6 +5301,41 @@ class MiniMaxH3Extender:
                 guide_frames=guide_frames,
             )
 
+            first_visible_offset = 0
+            if i == 0 and source_meta is not None:
+                _send_extender_progress(
+                    owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
+                )
+                source_context, source_guide_latent = _build_continue_context_latent(
+                    vae,
+                    audio_vae,
+                    data_path,
+                    source_meta,
+                    int(context_length),
+                    int(audio_context_length),
+                )
+                base_positive = positive
+                motion = MiniMaxH3MotionContextRAM()
+                motion_positive, source_trim, _, audio_tokens, _ = motion.apply(
+                    positive,
+                    latent,
+                    source_context,
+                    str(context_length),
+                    int(audio_context_length),
+                )
+                positive = _continue_head_guide_conditioning(
+                    base_positive,
+                    motion_positive,
+                    source_guide_latent,
+                )
+                first_visible_offset = int(source_trim)
+                _LOG.info(
+                    "MiniMax H3 Extender: Clip 0 -> Clip 1 (FL2VA) uses one %d-frame "
+                    "head guide at frame 0; preserved %d audio latent steps; trim=%d",
+                    int(source_trim), int(audio_tokens), int(source_trim),
+                )
+                del source_context, source_guide_latent, motion_positive, base_positive, motion
+
             _send_extender_progress(
                 owner, i, len(clips), "sampling",
                 f"Rendering FL2VA clip {i + 1}/{len(clips)}",
@@ -4579,6 +5363,7 @@ class MiniMaxH3Extender:
                 dependency_meta=dependency_meta,
                 computed=(str(run_mode) == "full_batch"),
                 generation_seed=cfg["seed"],
+                first_visible_offset=int(first_visible_offset),
             )
             statuses.append(cache_status)
             cached_ids.add(clip_id)
@@ -4693,10 +5478,18 @@ class MiniMaxH3Extender:
             data_path, final_manifest.get("segments", [])
         )
         normalized_json = _state_json(
-            clips, active_prompt_pack_signature, "fl2va"
+            clips,
+            active_prompt_pack_signature,
+            "fl2va",
+            motion_context=False,
+            continue_existing_video=continue_existing_video,
+            continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
         )
 
-        if resolution.get("mode") == "auto_from_ref" and frame_guides:
+        if resolution.get("mode") == "source_video":
+            resize_label = str(resolution.get("source_resize_mode") or target_resize_mode or "original")
+            resolution_text = f"{resolved_width}x{resolved_height} from Clip 0 ({resize_label} resize)"
+        elif resolution.get("mode") == "auto_from_ref" and frame_guides:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from FL keyframe "
                 f"@ {float(resolution['megapixels']):.2f}MP"
@@ -4744,12 +5537,18 @@ class MiniMaxH3Extender:
             "resolved_width": resolved_width,
             "resolved_height": resolved_height,
             "resolution_mode": str(resolution.get("mode") or "manual"),
-            "resolution_guide": "fl_keyframe" if frame_guides else "",
+            "resolution_guide": (
+                "clip_0" if resolution.get("mode") == "source_video"
+                else ("fl_keyframe" if frame_guides else "")
+            ),
             "resolution_fallback": bool(resolution.get("fallback", False)),
             "megapixels": float(resolution.get("megapixels", megapixels)),
             "cache_width": int(final_cache_resolution["width"]) if final_cache_resolution else 0,
             "cache_height": int(final_cache_resolution["height"]) if final_cache_resolution else 0,
             "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
+            "continue_existing_video": dict(continue_existing_video) if continue_existing_video is not None else None,
+            "source_video_normalized": dict(source_meta) if source_meta is not None else None,
+            "continue_video_resize": dict(continue_video_resize) if continue_existing_video is not None else None,
             "reference_count": 0,
             "reference_video_count": 0,
             "reference_video_audio_count": 0,
@@ -4805,6 +5604,13 @@ class MiniMaxH3Extender:
         motion_context = bool(motion_context)
         external_sigmas = kwargs.get("sigmas")
         sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
+        continue_video_input = kwargs.get("continue_existing_video")
+        continue_existing_video = (
+            _continue_video_from_native_input(continue_video_input)
+            if continue_video_input is not None
+            else _continue_video_from_state(clips_json)
+        )
+        continue_video_resize = _continue_resize_from_state(clips_json)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -4843,6 +5649,10 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
                 export_profile=requested_export_profile,
+                context_length=context_length,
+                audio_context_length=audio_context_length,
+                continue_existing_video=continue_existing_video,
+                continue_video_resize=continue_video_resize,
                 sigmas=external_sigmas,
             )
 
@@ -4859,6 +5669,10 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode, megapixels=megapixels,
                 refs_json=refs_json, ref_pack=ref_pack,
                 export_profile=requested_export_profile, kwargs=kwargs,
+                context_length=context_length,
+                audio_context_length=audio_context_length,
+                continue_existing_video=continue_existing_video,
+                continue_video_resize=continue_video_resize,
                 sigmas=external_sigmas,
             )
 
@@ -4871,6 +5685,76 @@ class MiniMaxH3Extender:
             )
 
         segments = manifest.get("segments", [])
+
+        # Optional Clip 0: a real existing video that anchors the project. The
+        # source file itself remains immutable in the content-addressed media
+        # store; the causal chain owns one 24-fps normalized disk working copy.
+        # Changing/removing Clip 0 necessarily invalidates the generated chain,
+        # because clip 1's Motion Context changes at its root.
+        source_meta = None
+        previous_source = manifest.get("source_video") if isinstance(manifest.get("source_video"), dict) else None
+        wanted_source_id = str(continue_existing_video.get("id") or "") if continue_existing_video is not None else ""
+        previous_source_id = str(previous_source.get("id") or "") if previous_source is not None else ""
+        target_width = target_height = 0
+        target_resize_mode = "original"
+        if continue_existing_video is not None:
+            target_width, target_height, target_resize_mode = _continue_target_resolution(
+                continue_existing_video,
+                continue_video_resize,
+            )
+        source_changed = wanted_source_id != previous_source_id
+        working_geometry_changed = bool(
+            continue_existing_video is not None
+            and previous_source is not None
+            and (
+                int(previous_source.get("width", 0) or 0) != int(target_width)
+                or int(previous_source.get("height", 0) or 0) != int(target_height)
+            )
+        )
+        source_working_changed = source_changed or working_geometry_changed
+
+        if source_working_changed:
+            if segments:
+                manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+                segments = []
+            _clear_continue_source_derivatives(data_path, remove_working=True)
+            manifest = dict(manifest)
+            manifest.pop("source_video", None)
+            manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, manifest)
+
+        if continue_existing_video is not None:
+            working_source = _continue_source_working_path(data_path)
+            if (
+                not source_working_changed
+                and previous_source is not None
+                and working_source.exists()
+                and str(previous_source.get("id") or "") == wanted_source_id
+            ):
+                source_meta = dict(previous_source)
+                source_meta["resize_mode"] = str(target_resize_mode)
+                source_meta["source_width"] = int(continue_existing_video.get("width", 0) or source_meta.get("source_width", 0) or 0)
+                source_meta["source_height"] = int(continue_existing_video.get("height", 0) or source_meta.get("source_height", 0) or 0)
+                _validate_continue_source_geometry(source_meta)
+            else:
+                _send_extender_progress(
+                    owner,
+                    -1,
+                    len(clips),
+                    "preparing",
+                    f"Preparing Clip 0 {target_width}x{target_height} @ {FPS} fps",
+                )
+                source_meta = _normalize_continue_source(
+                    data_path,
+                    continue_existing_video,
+                    target_width,
+                    target_height,
+                    target_resize_mode,
+                )
+            manifest = dict(manifest)
+            manifest["source_video"] = dict(source_meta)
+            manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, manifest)
 
         # Never silently turn a user-validated clip back into an active clip.
         # The loop below enforces the hard invariant: Validated=True can only be
@@ -4895,13 +5779,27 @@ class MiniMaxH3Extender:
                 skipped_slots=ref_pack_skipped_slots,
             )
         refs_signature = _refs_signature(refs)
-        requested_resolution = _resolve_generation_resolution(
-            resolution_mode,
-            megapixels,
-            width,
-            height,
-            refs,
-        )
+        if source_meta is not None:
+            working_width, working_height = _validate_continue_source_geometry(source_meta)
+            requested_resolution = {
+                "width": int(working_width),
+                "height": int(working_height),
+                "mode": "source_video",
+                "source_resize_mode": str(target_resize_mode),
+                "guide_ref": None,
+                "guide_src_width": int(continue_existing_video.get("width", 0) or 0),
+                "guide_src_height": int(continue_existing_video.get("height", 0) or 0),
+                "fallback": False,
+                "megapixels": float(working_width * working_height) / 1_000_000.0,
+            }
+        else:
+            requested_resolution = _resolve_generation_resolution(
+                resolution_mode,
+                megapixels,
+                width,
+                height,
+                refs,
+            )
 
         cache_resolution = _resolution_from_manifest(manifest)
         cache_has_segments = bool(segments) and cache_resolution is not None
@@ -4951,7 +5849,11 @@ class MiniMaxH3Extender:
                 pass
 
         if prompt_pack_imported and external_prompt_pack is not None:
-            imported_json = _state_json(clips, active_prompt_pack_signature, "ref2va")
+            imported_json = _state_json(
+                clips, active_prompt_pack_signature, "ref2va", motion_context=True,
+                continue_existing_video=continue_existing_video,
+                continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
+            )
             _send_extender_prompt_pack_import(
                 owner,
                 imported_json,
@@ -5312,6 +6214,7 @@ class MiniMaxH3Extender:
             )
 
             trim_frames = None
+            first_visible_offset = 0
             if i > 0:
                 if previous_proxy is None:
                     raise RuntimeError(
@@ -5324,6 +6227,38 @@ class MiniMaxH3Extender:
                     str(context_length),
                     int(audio_context_length),
                 )
+            elif source_meta is not None:
+                _send_extender_progress(
+                    owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
+                )
+                source_context, source_guide_latent = _build_continue_context_latent(
+                    vae,
+                    audio_vae,
+                    data_path,
+                    source_meta,
+                    int(context_length),
+                    int(audio_context_length),
+                )
+                base_positive = positive
+                motion_positive, source_trim, _, audio_tokens, _ = motion.apply(
+                    positive,
+                    latent,
+                    source_context,
+                    str(context_length),
+                    int(audio_context_length),
+                )
+                positive = _continue_head_guide_conditioning(
+                    base_positive,
+                    motion_positive,
+                    source_guide_latent,
+                )
+                first_visible_offset = int(source_trim)
+                _LOG.info(
+                    "MiniMax H3 Extender: Clip 0 -> Clip 1 uses one %d-frame "
+                    "head guide at frame 0; preserved %d audio latent steps; trim=%d",
+                    int(source_trim), int(audio_tokens), int(source_trim),
+                )
+                del source_context, source_guide_latent, motion_positive, base_positive
 
             _send_extender_progress(
                 owner,
@@ -5356,6 +6291,7 @@ class MiniMaxH3Extender:
                 generation_clip_id=cfg["id"],
                 computed=(str(run_mode) == "full_batch"),
                 generation_seed=cfg["seed"],
+                first_visible_offset=int(first_visible_offset),
             )
             previous_handle = result[0]
             previous_proxy = result[1]
@@ -5466,8 +6402,15 @@ class MiniMaxH3Extender:
                 break
         computed_indices = _ref2va_computed_indices(final_manifest)
 
-        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode, motion_context=True)
-        if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
+        normalized_json = _state_json(
+            clips, active_prompt_pack_signature, generation_mode, motion_context=True,
+            continue_existing_video=continue_existing_video,
+            continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
+        )
+        if resolution.get("mode") == "source_video":
+            resize_label = str(resolution.get("source_resize_mode") or target_resize_mode or "original")
+            resolution_text = f"{resolved_width}x{resolved_height} from Clip 0 ({resize_label} resize)"
+        elif resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
                 f"@ {float(resolution['megapixels']):.2f}MP"
@@ -5542,9 +6485,13 @@ class MiniMaxH3Extender:
             "resolved_height": resolved_height,
             "resolution_mode": str(resolution.get("mode") or "manual"),
             "resolution_guide": (
-                f"ref_{int(resolution['guide_ref'])}"
-                if resolution.get("guide_ref") is not None
-                else ""
+                "clip_0"
+                if resolution.get("mode") == "source_video"
+                else (
+                    f"ref_{int(resolution['guide_ref'])}"
+                    if resolution.get("guide_ref") is not None
+                    else ""
+                )
             ),
             "resolution_guide_width": int(resolution.get("guide_src_width", 0) or 0),
             "resolution_guide_height": int(resolution.get("guide_src_height", 0) or 0),
@@ -5555,6 +6502,9 @@ class MiniMaxH3Extender:
             "resolution_mismatch": False,
             "resolution_cache_locked": False,
             "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
+            "continue_existing_video": dict(continue_existing_video) if continue_existing_video is not None else None,
+            "source_video_normalized": dict(source_meta) if source_meta is not None else None,
+            "continue_video_resize": dict(continue_video_resize) if continue_existing_video is not None else None,
             "reference_cache_reset": False,
             "reference_count": int(_reference_count(refs)),
             "reference_video_count": int(active_ref_video_count),
@@ -5586,6 +6536,100 @@ class MiniMaxH3Extender:
                 BUILD,
             ),
         }
+
+
+def _continue_mode_cache_keys():
+    return (("ref2va", True), ("ref2va", False), ("fl2va", False))
+
+
+def _clear_continue_mode_caches(owner_id, *, preserve_for=None):
+    """Clear every generated mode cache, optionally moving Clip 0 to a target.
+
+    Mode changes with a connected Clip 0 deliberately invalidate all generated
+    clips. The normalized source working copy is disk-only and can be moved
+    atomically to the target mode cache so switching modes does not re-normalize
+    the original video or keep duplicate full videos in RAM.
+    """
+    owner_id = str(owner_id)
+    target_key = None
+    if preserve_for is not None:
+        target_mode, target_motion = preserve_for
+        target_mode = _normalize_generation_mode(target_mode)
+        target_key = (target_mode, bool(target_motion) if target_mode == "ref2va" else False)
+
+    preserved_meta = None
+    preserved_from = None
+    preserved_temp = None
+    if target_key is not None:
+        for mode, motion in _continue_mode_cache_keys():
+            cache_owner = _project_cache_owner_id(owner_id, mode, motion)
+            data_path, manifest_path = _chain_paths(cache_owner)
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            meta = (
+                manifest.get("source_video")
+                if isinstance(manifest, dict) and isinstance(manifest.get("source_video"), dict)
+                else None
+            )
+            working = _continue_source_working_path(data_path)
+            if meta is None or not working.exists() or working.stat().st_size <= 0:
+                continue
+            preserved_meta = dict(meta)
+            preserved_from = working
+            preserved_temp = _ensure_cache_root() / (
+                f"_continue_mode_switch_{_safe_name(owner_id)}_{uuid.uuid4().hex}.mkv"
+            )
+            os.replace(working, preserved_temp)
+            break
+
+    try:
+        for mode, motion in _continue_mode_cache_keys():
+            cache_owner = _project_cache_owner_id(owner_id, mode, motion)
+            data_path, _manifest_path = _chain_paths(cache_owner)
+            _replace_cache_transaction(
+                owner_id,
+                generation_mode=mode,
+                motion_context=motion,
+            )
+            _clear_continue_source_derivatives(data_path, remove_working=True)
+        clear_full_batch_interrupt(owner_id, "ref2va")
+        clear_full_batch_interrupt(owner_id, "fl2va")
+
+        if (
+            target_key is not None
+            and preserved_temp is not None
+            and preserved_temp.exists()
+            and preserved_meta is not None
+        ):
+            target_mode, target_motion = target_key
+            target_owner = _project_cache_owner_id(owner_id, target_mode, target_motion)
+            target_data, target_manifest_path, target_manifest = _manifest_for_first(target_owner, FPS)
+            target_working = _continue_source_working_path(target_data)
+            target_working.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(preserved_temp, target_working)
+            target_manifest = dict(target_manifest)
+            target_manifest["source_video"] = dict(preserved_meta)
+            target_manifest["sequence_mode"] = (
+                "fl2va"
+                if target_mode == "fl2va"
+                else ("ref2va" if bool(target_motion) else "ref2va_independent")
+            )
+            target_manifest["updated_at"] = time.time()
+            _write_json_atomic(target_manifest_path, target_manifest)
+        return bool(preserved_meta is not None)
+    except Exception:
+        if preserved_temp is not None and preserved_temp.exists() and preserved_from is not None:
+            try:
+                preserved_from.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(preserved_temp, preserved_from)
+            except Exception:
+                pass
+        raise
+    finally:
+        if preserved_temp is not None:
+            try:
+                preserved_temp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 NODE_CLASS_MAPPINGS = {
@@ -5711,6 +6755,76 @@ if getattr(PromptServer, "instance", None) is not None:
             response.headers["Content-Disposition"] = "inline"
             response.headers["Cache-Control"] = "private, max-age=3600"
             return response
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/h3_extender/continue_video/probe")
+    async def h3_extender_continue_video_probe(request):
+        """Return metadata for a connected native Load Video without copying it."""
+        try:
+            body = await request.json()
+            descriptor = _probe_continue_video_file(body.get("file"))
+            return web.json_response({"ok": True, "video": descriptor})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.get("/h3_extender/continue_video/source")
+    async def h3_extender_continue_video_source(request):
+        """Stream the native Clip 0 source for the frame-reference picker.
+
+        The file remains disk-backed; the browser seeks/decodes only what it
+        needs and the Extender never materializes the full source in RAM.
+        """
+        try:
+            path = _resolve_continue_video_selected_file(request.query.get("file"))
+            guessed_type, _ = mimetypes.guess_type(path.name)
+            response = web.FileResponse(path)
+            response.content_type = guessed_type if guessed_type and guessed_type.startswith("video/") else "video/mp4"
+            response.headers["Content-Disposition"] = "inline"
+            response.headers["Cache-Control"] = "private, max-age=3600"
+            return response
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/h3_extender/continue_video/reset_cache")
+    async def h3_extender_continue_video_reset_cache(request):
+        """Immediately discard the causal generated chain when Clip 0 changes.
+
+        This prevents a newly selected source from being saved together with an
+        old incompatible latent/preview cache before the next Queue. The immutable
+        source file in the content-addressed media store is never deleted here.
+        """
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+
+            found = _clear_continue_mode_caches(owner_id, preserve_for=None)
+            return web.json_response({"ok": True, "found": bool(found)})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/h3_extender/continue_video/invalidate_modes")
+    async def h3_extender_continue_video_invalidate_modes(request):
+        """Invalidate all generated mode caches while preserving normalized Clip 0."""
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+            target_mode = _normalize_generation_mode(body.get("generation_mode") or "ref2va")
+            target_motion = bool(body.get("motion_context", True))
+            preserved = _clear_continue_mode_caches(
+                owner_id,
+                preserve_for=(target_mode, target_motion),
+            )
+            return web.json_response({
+                "ok": True,
+                "source_preserved": bool(preserved),
+                "generation_mode": target_mode,
+                "motion_context": bool(target_motion),
+            })
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 

@@ -223,6 +223,7 @@ def store_segment(
     run_mode="full_batch",
     computed=False,
     generation_seed=None,
+    first_visible_offset=0,
 ):
     """Append latent bytes and replace/insert one logical clip by stable id."""
     from . import motion_context_disk as d
@@ -249,6 +250,18 @@ def store_segment(
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0
+    if clip_index == 0 and int(first_visible_offset or 0) > 0:
+        visible_offset = int(first_visible_offset)
+        source_frames = int(desc.get("frames", 0) or 0)
+        if visible_offset < 0 or visible_offset >= source_frames:
+            raise ValueError(
+                "MiniMax H3 Extender: invalid Clip 0 continuation visible offset "
+                f"{visible_offset}/{source_frames}."
+            )
+        desc["source_frames"] = int(source_frames)
+        desc["visible_offset"] = int(visible_offset)
+        desc["frames"] = int(source_frames - visible_offset)
+        desc["continued_from_source"] = True
     if bool(computed) and not bool(validated):
         desc["computed"] = True
     else:
@@ -596,6 +609,10 @@ def run(
     ref_pack,
     export_profile,
     kwargs,
+    context_length,
+    audio_context_length,
+    continue_existing_video=None,
+    continue_video_resize=None,
     sigmas=None,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
@@ -624,13 +641,29 @@ def run(
         )
 
     refs_signature = e._refs_signature(refs)
-    requested_resolution = e._resolve_generation_resolution(
-        resolution_mode, megapixels, width, height, refs
+    manifest, source_meta, source_resolution, target_resize_mode, source_working_changed = (
+        e._prepare_continue_source_random_access(
+            data_path,
+            manifest_path,
+            manifest,
+            clips,
+            continue_existing_video,
+            continue_video_resize,
+            sequence_mode=SEQUENCE_MODE,
+            owner=owner,
+        )
+    )
+    requested_resolution = (
+        dict(source_resolution)
+        if source_resolution is not None
+        else e._resolve_generation_resolution(
+            resolution_mode, megapixels, width, height, refs
+        )
     )
     resolution = dict(requested_resolution)
     resolution["requested_width"] = int(requested_resolution["width"])
     resolution["requested_height"] = int(requested_resolution["height"])
-    resolution["cache_reset"] = False
+    resolution["cache_reset"] = bool(source_working_changed)
     resolved_width = int(resolution["width"])
     resolved_height = int(resolution["height"])
 
@@ -657,7 +690,14 @@ def run(
             resolution["cache_reset"] = True
 
     if prompt_pack_imported and external_prompt_pack is not None:
-        imported_json = e._state_json(clips, active_prompt_pack_signature, "ref2va", motion_context=False)
+        imported_json = e._state_json(
+            clips,
+            active_prompt_pack_signature,
+            "ref2va",
+            motion_context=False,
+            continue_existing_video=continue_existing_video,
+            continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
+        )
         e._send_extender_prompt_pack_import(
             owner,
             imported_json,
@@ -938,6 +978,41 @@ def run(
             audio_native_offset=audio_native_offset,
         )
 
+        first_visible_offset = 0
+        if i == 0 and source_meta is not None:
+            e._send_extender_progress(
+                owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
+            )
+            source_context, source_guide_latent = e._build_continue_context_latent(
+                vae,
+                audio_vae,
+                data_path,
+                source_meta,
+                int(context_length),
+                int(audio_context_length),
+            )
+            base_positive = positive
+            motion = e.MiniMaxH3MotionContextRAM()
+            motion_positive, source_trim, _, audio_tokens, _ = motion.apply(
+                positive,
+                latent,
+                source_context,
+                str(context_length),
+                int(audio_context_length),
+            )
+            positive = e._continue_head_guide_conditioning(
+                base_positive,
+                motion_positive,
+                source_guide_latent,
+            )
+            first_visible_offset = int(source_trim)
+            e._LOG.info(
+                "MiniMax H3 Extender: Clip 0 -> Clip 1 (Motion OFF) uses one %d-frame "
+                "head guide at frame 0; preserved %d audio latent steps; trim=%d",
+                int(source_trim), int(audio_tokens), int(source_trim),
+            )
+            del source_context, source_guide_latent, motion_positive, base_positive, motion
+
         e._send_extender_progress(
             owner, i, len(clips), "sampling",
             f"Rendering Ref2VA independent clip {i + 1}/{len(clips)}",
@@ -965,6 +1040,7 @@ def run(
             run_mode=str(run_mode),
             computed=(str(run_mode) == "full_batch"),
             generation_seed=cfg["seed"],
+            first_visible_offset=int(first_visible_offset),
         )
         statuses.append(cache_status)
         generated.append(i)
@@ -1055,10 +1131,18 @@ def run(
     cached_count = len(cached_now)
     validated_count = len(validated_ids)
     normalized_json = e._state_json(
-        clips, active_prompt_pack_signature, "ref2va", motion_context=False
+        clips,
+        active_prompt_pack_signature,
+        "ref2va",
+        motion_context=False,
+        continue_existing_video=continue_existing_video,
+        continue_video_resize=(continue_video_resize if continue_existing_video is not None else None),
     )
 
-    if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
+    if resolution.get("mode") == "source_video":
+        resize_label = str(resolution.get("source_resize_mode") or target_resize_mode or "original")
+        resolution_text = f"{resolved_width}x{resolved_height} from Clip 0 ({resize_label} resize)"
+    elif resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
         resolution_text = (
             f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
             f"@ {float(resolution['megapixels']):.2f}MP"
@@ -1125,7 +1209,9 @@ def run(
         "resolved_height": resolved_height,
         "resolution_mode": str(resolution.get("mode") or "manual"),
         "resolution_guide": (
-            f"ref_{int(resolution['guide_ref'])}" if resolution.get("guide_ref") is not None else ""
+            "clip_0"
+            if resolution.get("mode") == "source_video"
+            else (f"ref_{int(resolution['guide_ref'])}" if resolution.get("guide_ref") is not None else "")
         ),
         "resolution_guide_width": int(resolution.get("guide_src_width", 0) or 0),
         "resolution_guide_height": int(resolution.get("guide_src_height", 0) or 0),
@@ -1136,6 +1222,9 @@ def run(
         "resolution_mismatch": False,
         "resolution_cache_locked": False,
         "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
+        "continue_existing_video": dict(continue_existing_video) if continue_existing_video is not None else None,
+        "source_video_normalized": dict(source_meta) if source_meta is not None else None,
+        "continue_video_resize": dict(continue_video_resize) if continue_existing_video is not None else None,
         "reference_cache_reset": False,
         "reference_count": int(e._reference_count(refs)),
         "reference_video_count": int(active_ref_video_count),

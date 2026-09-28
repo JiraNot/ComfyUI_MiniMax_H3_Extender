@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.8.5"
+BUILD = "motion-context-disk-v2.9.0"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -727,7 +727,12 @@ def _cache_size_mb(data_path, manifest_path):
     preview_path = data_path.with_suffix(".preview.mp4")
     preview_video_path = data_path.with_suffix(".preview.video.mp4")
     audio_cache_path = _decoded_audio_cache_path(data_path)
-    for p in (data_path, Path(manifest_path), preview_path, preview_video_path, audio_cache_path):
+    source_working_path = data_path.with_suffix(".source.mkv")
+    source_preview_path = data_path.with_suffix(".source.preview.video.mp4")
+    for p in (
+        data_path, Path(manifest_path), preview_path, preview_video_path, audio_cache_path,
+        source_working_path, source_preview_path,
+    ):
         try:
             total += p.stat().st_size
         except OSError:
@@ -1098,6 +1103,7 @@ class MiniMaxH3MotionContextDiskJoin:
         computed=False,
         generation_seed=None,
         generation_clip_id=None,
+        first_visible_offset=0,
     ):
         data_path, manifest_path, manifest, mode, stop, index = _effective_state(
             previous_cache, run_mode, fps, unique_id
@@ -1177,6 +1183,18 @@ class MiniMaxH3MotionContextDiskJoin:
                 validated=bool(validated),
                 manifest=manifest,
             )
+            if index == 0 and int(first_visible_offset or 0) > 0:
+                visible_offset = int(first_visible_offset)
+                source_frames = int(desc.get("frames", 0) or 0)
+                if visible_offset < 0 or visible_offset >= source_frames:
+                    raise ValueError(
+                        "MiniMax H3 Disk Join: invalid Clip 0 continuation visible offset "
+                        f"{visible_offset}/{source_frames}."
+                    )
+                desc["source_frames"] = int(source_frames)
+                desc["visible_offset"] = int(visible_offset)
+                desc["frames"] = int(source_frames - visible_offset)
+                desc["continued_from_source"] = True
             if generation_seed is not None:
                 desc["generation_seed"] = int(generation_seed)
             if generation_clip_id is not None:
@@ -1704,8 +1722,8 @@ def _decode_pair_audio(data_path, prev_desc, curr_desc, audio_vae, fps, seam_shi
     prev_a = _load_segment_audio(data_path, prev_desc)
     next_a = _load_segment_audio(data_path, curr_desc)
 
-    previous_frames = int(prev_desc["frames"])
-    next_frames = int(curr_desc["frames"])
+    previous_frames = int(prev_desc.get("source_frames", prev_desc["frames"]))
+    next_frames = int(curr_desc.get("source_frames", curr_desc["frames"]))
     trim = int(curr_desc["trim_frames"])
     video_trim_t = 0 if trim == 0 else _steps_for_frames(trim)
     if trim > 0 and video_trim_t is None:
@@ -2045,9 +2063,9 @@ def _color_is_neutral(value):
     return all(abs(float(c[k]) - 100.0) < 1e-6 for k in ("saturation", "contrast", "brightness"))
 
 
-def _color_timeline(segments, fps):
+def _color_timeline(segments, fps, source_frames=0):
     fps = float(fps or FPS)
-    cursor = 0
+    cursor = max(0, int(source_frames or 0))
     out = []
     for i, desc in enumerate(segments or []):
         contribution = int(desc.get("frames", 0))
@@ -2387,6 +2405,179 @@ def _decoded_preview_cache_path(data_path):
 
 def _decoded_preview_video_cache_path(data_path):
     return Path(data_path).with_suffix(".preview.video.mp4")
+
+
+
+def _source_working_path(data_path):
+    return Path(data_path).with_suffix(".source.mkv")
+
+
+def _source_preview_video_path(data_path):
+    return Path(data_path).with_suffix(".source.preview.video.mp4")
+
+
+def _source_meta(manifest):
+    value = manifest.get("source_video") if isinstance(manifest, dict) else None
+    return dict(value) if isinstance(value, dict) and str(value.get("id") or "") else None
+
+
+def _ensure_source_preview_video(data_path, manifest, ffmpeg, token):
+    """Create/reuse the H.264 video-only Clip 0 prefix used by live previews."""
+    meta = _source_meta(manifest)
+    if meta is None:
+        return None
+    source = _source_working_path(data_path)
+    if not source.exists():
+        raise FileNotFoundError("H3 Final Decode: normalized Clip 0 cache is missing.")
+    target = _source_preview_video_path(data_path)
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp.mp4")
+    log_path = _ensure_cache_root() / f"_{token}_source_preview.log"
+    chosen_ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
+    enc = _h264_encode_args(chosen_ffmpeg, FULL_BATCH_H264_CACHE_CRF, FULL_BATCH_H264_CACHE_PRESET)
+    cmd = [
+        chosen_ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(source), "-map", "0:v:0", "-an",
+        *enc, "-movflags", "+faststart", str(temp),
+    ]
+    try:
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+        if proc.returncode != 0 or not temp.exists() or temp.stat().st_size <= 0:
+            detail = ""
+            try:
+                detail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"H3 Final Decode: Clip 0 preview encode failed.\n{detail}")
+        os.replace(temp, target)
+        return target
+    finally:
+        temp.unlink(missing_ok=True)
+        log_path.unlink(missing_ok=True)
+
+
+def _source_final_video_path(data_path, export_profile):
+    profile = normalize_full_batch_export_profile(export_profile)
+    signature = _full_batch_export_profile_signature(profile)[:16]
+    ext = _full_batch_export_profile_extension(profile)
+    root = _final_segment_cache_dir(data_path)
+    return root / f"source_{signature}.{ext}"
+
+
+def _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token):
+    """Encode Clip 0 once into the exact final video profile; generated clips remain stream-copy."""
+    meta = _source_meta(manifest)
+    if meta is None:
+        return None
+    source = _source_working_path(data_path)
+    if not source.exists():
+        raise FileNotFoundError("H3 Final Decode: normalized Clip 0 cache is missing.")
+    profile = normalize_full_batch_export_profile(export_profile)
+    target = _source_final_video_path(data_path, profile)
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp.{target.suffix.lstrip('.')}")
+    log_path = _ensure_cache_root() / f"_{token}_source_final.log"
+    codec = profile["codec"]
+    chosen_ffmpeg = ffmpeg
+    if codec == "H.265 / HEVC":
+        enc = ["-c:v", "libx265", "-preset", profile["preset"], "-crf", str(profile["crf"]), "-pix_fmt", "yuv420p"]
+    elif codec == "FFV1 lossless":
+        enc = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
+    else:
+        force_cpu = codec == "H.264 CPU (libx264)"
+        if not force_cpu:
+            chosen_ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
+        enc = _h264_encode_args(chosen_ffmpeg, profile["crf"], profile["preset"], force_cpu=force_cpu)
+    cmd = [
+        chosen_ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(source), "-map", "0:v:0", "-an", *enc,
+    ]
+    if target.suffix.lower() == ".mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd.append(str(temp))
+    try:
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+        if proc.returncode != 0 or not temp.exists() or temp.stat().st_size <= 0:
+            detail = ""
+            try:
+                detail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"H3 Final Decode: Clip 0 final-profile encode failed.\n{detail}")
+        os.replace(temp, target)
+        return target
+    finally:
+        temp.unlink(missing_ok=True)
+        log_path.unlink(missing_ok=True)
+
+
+def _source_frame_count(meta):
+    if not isinstance(meta, dict):
+        return 0
+    value = int(meta.get("frame_count", 0) or 0)
+    if value <= 0:
+        value = int(round(float(meta.get("duration", 0.0) or 0.0) * float(meta.get("fps", FPS) or FPS)))
+    return max(0, value)
+
+
+def _write_source_pcm_prefix(ffmpeg, source_path, meta, file_obj, sample_rate, channels):
+    """Stream Clip 0 PCM to the final timeline without retaining the full source audio in RAM."""
+    frames = _source_frame_count(meta)
+    if frames <= 0:
+        return 0, None
+    target_samples = int(round(float(frames) / float(FPS) * int(sample_rate)))
+    target_bytes = int(target_samples) * int(channels) * 4
+    tail_bytes = max(2 * int(channels) * 4, int(round(0.050 * int(sample_rate))) * int(channels) * 4)
+    tail = bytearray()
+    written = 0
+
+    proc = None
+    if bool(meta.get("has_audio", False)) and Path(source_path).exists():
+        cmd = [
+            ffmpeg, "-v", "error", "-i", str(source_path), "-vn",
+            "-ac", str(int(channels)), "-ar", str(int(sample_rate)),
+            "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    try:
+        while written < target_bytes:
+            remaining = target_bytes - written
+            if proc is not None and proc.stdout is not None:
+                chunk = proc.stdout.read(min(1024 * 1024, remaining))
+            else:
+                chunk = b""
+            if not chunk:
+                chunk = bytes(min(1024 * 1024, remaining))
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            file_obj.write(chunk)
+            written += len(chunk)
+            tail.extend(chunk)
+            if len(tail) > tail_bytes:
+                del tail[:-tail_bytes]
+        if proc is not None:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.wait()
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+    previous_tail = None
+    if tail:
+        arr = np.frombuffer(bytes(tail), dtype=np.float32)
+        usable = (arr.size // int(channels)) * int(channels)
+        if usable > 0:
+            arr = arr[-usable:].reshape(-1, int(channels)).T.copy()
+            previous_tail = torch.from_numpy(arr).unsqueeze(0)
+    return int(target_samples), previous_tail
 
 
 def _validated_prefix_count(segments):
@@ -2891,6 +3082,7 @@ def _write_preview_pcm_audio(
     token,
     individual_raw_audio_paths=None,
     individual_errors=None,
+    source_meta=None,
 ):
     """Write exact timeline PCM for a progressive preview.
 
@@ -2921,6 +3113,20 @@ def _write_preview_pcm_audio(
     cumulative_frames = 0
     previous_tail = None
     with open(raw_audio_path, "wb") as af:
+        if isinstance(source_meta, dict):
+            source_frames = _source_frame_count(source_meta)
+            if source_frames > 0:
+                source_samples, previous_tail = _write_source_pcm_prefix(
+                    ffmpeg,
+                    _source_working_path(data_path),
+                    source_meta,
+                    af,
+                    sample_rate,
+                    channels,
+                )
+                written_samples = int(source_samples)
+                cumulative_frames = int(source_frames)
+
         for i in range(count):
             desc = segments[i]
             audio = _load_cached_decoded_audio(data_path, desc)
@@ -2937,7 +3143,7 @@ def _write_preview_pcm_audio(
                     "H3 progressive preview: decoded audio cache is missing."
                 )
 
-            if i > 0:
+            if previous_tail is not None:
                 wave = _smooth_segment_entry_level(previous_tail, wave, sample_rate)
                 wave = _declick_segment(previous_tail, wave, sample_rate, 12.0)
 
@@ -3043,6 +3249,7 @@ def _assemble_progressive_preview(
     fps,
     output_path,
     token,
+    source_meta=None,
 ):
     """Assemble a full preview with video stream-copy + one AAC encode."""
     root = _ensure_cache_root()
@@ -3062,6 +3269,7 @@ def _assemble_progressive_preview(
             fps,
             raw_audio,
             token,
+            source_meta=source_meta,
         )
         if Path(output_path).exists():
             Path(output_path).unlink()
@@ -3104,12 +3312,20 @@ def _render_one_final_video_segment(
             video = video.reshape(
                 -1, video.shape[-3], video.shape[-2], video.shape[-1]
             )
-        expected = int(curr["frames"])
-        if int(video.shape[0]) != expected:
+        source_frames = int(curr.get("source_frames", curr.get("frames", 0)) or 0)
+        visible_frames = int(curr.get("frames", source_frames) or source_frames)
+        visible_offset = int(curr.get("visible_offset", 0) or 0)
+        if int(video.shape[0]) != source_frames:
             raise RuntimeError(
                 f"H3 progressive preview: clip 1 decoded {video.shape[0]}, "
-                f"expected {expected}."
+                f"expected source frames {source_frames}."
             )
+        if visible_offset < 0 or visible_offset + visible_frames > source_frames:
+            raise RuntimeError(
+                "H3 progressive preview: Clip 1 visible window lies outside its source latent."
+            )
+        if visible_offset or visible_frames != source_frames:
+            video = video[visible_offset:visible_offset + visible_frames]
         del v
         return video, 0
 
@@ -3234,6 +3450,8 @@ def _export_final_from_exact_segment_caches(
     workflow=None,
     prompt=None,
     progress=None,
+    source_meta=None,
+    source_segment_path=None,
 ):
     """Mux a Full-Batch final from already-final video segments.
 
@@ -3264,7 +3482,10 @@ def _export_final_from_exact_segment_caches(
         ]
 
     try:
-        _concat_video_stream_copy(ffmpeg, segment_paths, joined_video, concat_log)
+        final_video_inputs = list(segment_paths)
+        if source_segment_path is not None:
+            final_video_inputs.insert(0, Path(source_segment_path))
+        _concat_video_stream_copy(ffmpeg, final_video_inputs, joined_video, concat_log)
         sr, channels, _ = _write_preview_pcm_audio(
             ffmpeg,
             data_path,
@@ -3277,6 +3498,7 @@ def _export_final_from_exact_segment_caches(
                 individual_audio_paths if bool(save_individual_clips) else None
             ),
             individual_errors=individual_audio_errors,
+            source_meta=source_meta,
         )
         _mux_final(
             ffmpeg,
@@ -3826,8 +4048,17 @@ def _sync_committed_preview(
         or current_count > target
         or not committed_video_path.exists()
     )
+    source_meta = _source_meta(manifest)
+    source_preview_path = (
+        _ensure_source_preview_video(data_path, manifest, ffmpeg, token)
+        if source_meta is not None
+        else None
+    )
     start_i = 0 if rebuild else current_count
-    video_inputs = [] if rebuild else [committed_video_path]
+    if rebuild:
+        video_inputs = [source_preview_path] if source_preview_path is not None else []
+    else:
+        video_inputs = [committed_video_path]
     temp_segments = []
     root = _ensure_cache_root()
     joined_video_tmp = committed_video_path.with_name(
@@ -3894,6 +4125,7 @@ def _sync_committed_preview(
             fps,
             raw_audio,
             f"{token}_commit_pcm",
+            source_meta=source_meta,
         )
         _mux_final(
             ffmpeg,
@@ -3992,9 +4224,10 @@ def _export_live_candidate_preview(
         # validated the complete committed preview is already authoritative, so
         # decoding the last clip/pair merely to manufacture an unused last_frame
         # would waste a full VideoVAE pass and several GB of temporary RGB memory.
+        source_meta = _source_meta(manifest)
         return (
             preview_path,
-            int(manifest.get("final_frame_count", 0)),
+            int(manifest.get("final_frame_count", 0)) + _source_frame_count(source_meta),
             0,
             None,
             "committed_full_cache",
@@ -4082,11 +4315,16 @@ def _export_live_candidate_preview(
         # FULL VIDEO preview: stream-copy only the H.264 video.  Audio is
         # rebuilt from lossless per-clip PCM and encoded ONCE for the complete
         # preview, so AAC priming/padding can never sit on an internal seam.
-        video_inputs = (
-            [committed_video_path, candidate_mp4]
-            if committed_video_path.exists() and validated_count > 0
-            else [candidate_mp4]
-        )
+        source_meta = _source_meta(manifest)
+        if committed_video_path.exists() and validated_count > 0:
+            video_inputs = [committed_video_path, candidate_mp4]
+        else:
+            source_preview_path = (
+                _ensure_source_preview_video(data_path, manifest, ffmpeg, token)
+                if source_meta is not None
+                else None
+            )
+            video_inputs = ([source_preview_path] if source_preview_path is not None else []) + [candidate_mp4]
         segments = [dict(x) for x in manifest.get("segments", [])]
         _assemble_progressive_preview(
             ffmpeg,
@@ -4097,9 +4335,10 @@ def _export_live_candidate_preview(
             fps,
             preview_path,
             f"{token}_candidate_full",
+            source_meta=source_meta,
         )
 
-        total_frames = int(manifest.get("final_frame_count", 0))
+        total_frames = int(manifest.get("final_frame_count", 0)) + _source_frame_count(source_meta)
 
         _LOG.info(
             "H3 v12.5 FULL preview: cached validated clips=%d, candidate=%d, "
@@ -4184,6 +4423,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     committed_path = _decoded_preview_cache_path(data_path)
     committed_video_path = _decoded_preview_video_cache_path(data_path)
     committed_count = int(manifest.get("preview_committed_count", 0))
+    source_meta = _source_meta(manifest)
 
     # Fastest path: the persistent committed preview already contains every
     # cached clip. Just republish it to ComfyUI temp for /view.
@@ -4201,7 +4441,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         return {
             "path": preview_path,
             "clip_count": int(len(segments)),
-            "frame_count": int(_final_frame_count(segments)),
+            "frame_count": int(_final_frame_count(segments)) + _source_frame_count(source_meta),
             "fps": float(manifest.get("fps", FPS)),
             "cache_mode": "committed_preview",
             "interrupted": bool(interrupted_snapshot),
@@ -4228,6 +4468,11 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         ):
             video_inputs.append(committed_video_path)
             start_i = committed_count
+        elif source_meta is not None:
+            source_preview_path = _ensure_source_preview_video(
+                data_path, manifest, _find_ffmpeg(), token
+            )
+            video_inputs.append(source_preview_path)
 
         for i in range(start_i, len(segments)):
             desc = segments[i]
@@ -4253,6 +4498,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
             float(manifest.get("fps", FPS)),
             temp_preview,
             token,
+            source_meta=source_meta,
         )
 
         preview_path = _reserve_preview_temp_path(final_id)
@@ -4261,7 +4507,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         return {
             "path": preview_path,
             "clip_count": int(len(segments)),
-            "frame_count": int(_final_frame_count(segments)),
+            "frame_count": int(_final_frame_count(segments)) + _source_frame_count(source_meta),
             "fps": float(manifest.get("fps", FPS)),
             "cache_mode": "decoded_blobs",
             "interrupted": bool(interrupted_snapshot),
@@ -5100,7 +5346,9 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 project_autosave_settings=project_autosave_settings,
                 save_individual_clips=bool(save_individual_clips),
             )
-        color_timeline = _color_timeline(segments, float(fps))
+        source_meta = _source_meta(manifest)
+        source_frames = _source_frame_count(source_meta)
+        color_timeline = _color_timeline(segments, float(fps), source_frames=source_frames)
 
         ffmpeg = _find_ffmpeg()
 
@@ -5153,7 +5401,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             _embed_final_metadata_in_place(autosave_path, workflow=workflow, prompt=prompt)
             progress.advance()
 
-            total_frames = int(manifest.get("final_frame_count", 0))
+            total_frames = int(manifest.get("final_frame_count", 0)) + int(source_frames)
             total_duration = float(total_frames / float(fps))
             size = _cache_size_mb(data_path, manifest_path)
             item = _comfy_media_item(preview_path, fps, "temp")
@@ -5214,7 +5462,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         )
         if interrupted:
             segments = [dict(x) for x in segments[:snapshot_count]]
-        color_timeline = _color_timeline(segments, float(fps))
+        color_timeline = _color_timeline(segments, float(fps), source_frames=source_frames)
         token = f"full_exact_{_safe_name(unique_id)}_{uuid.uuid4().hex[:8]}"
 
         # Ensure only missing/dirty exact-final clips. Fresh v2.5.8 Full Batch
@@ -5236,7 +5484,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             exact_segment_paths.append(final_segment_path)
         all_manifest_segments = [dict(x) for x in manifest.get("segments", [])]
         segments = all_manifest_segments[:len(segments)]
-        color_timeline = _color_timeline(segments, float(fps))
+        color_timeline = _color_timeline(segments, float(fps), source_frames=source_frames)
 
         # Browser preview remains neutral H.264 and independent of final quality.
         # Its assembly is also video stream-copy from the preview checkpoints.
@@ -5253,10 +5501,15 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         )
         progress.advance()
         preview_path = _publish_full_preview(committed_path, unique_id)
-        expected_frames = int(_final_frame_count(segments))
+        expected_frames = int(_final_frame_count(segments)) + int(source_frames)
 
         extension = _full_batch_export_profile_extension(export_profile)
         output_path = _next_output_path(out_dir, filename_prefix, extension)
+        source_final_segment = (
+            _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token)
+            if source_meta is not None
+            else None
+        )
         final_video_mode, individual_export_info = _export_final_from_exact_segment_caches(
             ffmpeg=ffmpeg,
             segment_paths=exact_segment_paths,
@@ -5271,6 +5524,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             workflow=workflow,
             prompt=prompt,
             progress=progress,
+            source_meta=source_meta,
+            source_segment_path=source_final_segment,
         )
 
         _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)

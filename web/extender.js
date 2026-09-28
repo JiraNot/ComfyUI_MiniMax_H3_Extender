@@ -194,8 +194,34 @@ function normalizeMediaDescriptor(value, expectedKind = "") {
         width: Math.max(0, Number(value.width || 0)),
         height: Math.max(0, Number(value.height || 0)),
         fps: Math.max(0, Number(value.fps || 0)),
+        frame_count: Math.max(0, Math.trunc(Number(value.frame_count || 0))),
         has_audio: Boolean(value.has_audio),
+        video_codec: String(value.video_codec || ""),
+        audio_codec: String(value.audio_codec || ""),
     };
+}
+
+function continueVideoDescriptor(state) {
+    return normalizeMediaDescriptor(state?.continue_existing_video, "video");
+}
+
+function activeContinueVideoDescriptor(runtime) {
+    return normalizeMediaDescriptor(runtime?.continueVideoPreviewMeta, "video")
+        || continueVideoDescriptor(runtime?.state);
+}
+
+function applyExecutedContinueVideoDescriptor(runtime, info) {
+    if (!runtime?.state || !info || typeof info !== "object") return null;
+    const source = normalizeMediaDescriptor(info.continue_existing_video, "video")
+        || normalizeMediaDescriptor(info.source_video_normalized, "video");
+    if (!source) return null;
+    runtime.state.continue_existing_video = source;
+    runtime.continueVideoPreviewMeta = source;
+    runtime.continueVideoWorkingMeta = normalizeMediaDescriptor(info.source_video_normalized, "video");
+    if (info.continue_video_resize && typeof info.continue_video_resize === "object") {
+        runtime.state.continue_video_resize = normalizedContinueVideoResize(info.continue_video_resize);
+    }
+    return source;
 }
 
 function localMediaPreviewUrl(value) {
@@ -640,12 +666,13 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
     //   ref_video_2 / fps_2 / video_audio_2
     //   ref_video_3 / fps_3 / video_audio_3
     //   ref_pack / prompt_pack
-    //   sigmas (always last — never shift older optional indexes)
+    //   sigmas
+    //   continue_existing_video (v2.9.0 append-only socket; always last)
     if (!node?.inputs?.length) return false;
 
     const packOrder = ["ref_pack", "prompt_pack"];
-    const trailingNames = new Set(["sigmas"]);
-    const dynamicNames = new Set([...packOrder, ...trailingNames]);
+    const trailingOrder = ["sigmas", "continue_existing_video"];
+    const dynamicNames = new Set([...packOrder, ...trailingOrder]);
     for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
         dynamicNames.add(`ref_audio_${i}`);
     }
@@ -682,7 +709,7 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
         const input = byName.get(name);
         if (input) desired.push(input);
     }
-    for (const name of trailingNames) {
+    for (const name of trailingOrder) {
         const input = byName.get(name);
         if (input) desired.push(input);
     }
@@ -1072,6 +1099,33 @@ function normalizedManualResolution(value) {
     return { width, height };
 }
 
+function normalizedContinueVideoResize(value) {
+    const rawMode = String(value?.mode || "original").toLowerCase();
+    const mode = ["original", "auto", "manual"].includes(rawMode) ? rawMode : "original";
+    const megapixels = Math.max(0.01, Math.min(16.0, Number(value?.megapixels ?? DEFAULT_MEGAPIXELS) || DEFAULT_MEGAPIXELS));
+    const width = Math.max(32, Math.min(MAX_RESOLUTION, Math.trunc(Number(value?.width || 896)) || 896));
+    const height = Math.max(32, Math.min(MAX_RESOLUTION, Math.trunc(Number(value?.height || 576)) || 576));
+    return { mode, megapixels, width, height };
+}
+
+function continueVideoWorkingResolution(runtime, source = activeContinueVideoDescriptor(runtime)) {
+    if (!source || !(Number(source.width) > 0) || !(Number(source.height) > 0)) return null;
+    const resize = normalizedContinueVideoResize(runtime?.state?.continue_video_resize);
+    if (resize.mode === "auto") {
+        const resolved = autoResolutionFromDimensions(source.width, source.height, resize.megapixels);
+        return resolved ? { ...resolved, mode: "auto", compatible: true } : null;
+    }
+    if (resize.mode === "manual") {
+        const resolved = effectiveManualResolution(resize.width, resize.height);
+        return { ...resolved, mode: "manual", compatible: true };
+    }
+    const width = Math.trunc(Number(source.width || 0));
+    const height = Math.trunc(Number(source.height || 0));
+    const compatible = width >= 32 && height >= 32 && width <= MAX_RESOLUTION && height <= MAX_RESOLUTION
+        && (width % 16) === 0 && (height % 16) === 0;
+    return { width, height, mode: "original", compatible };
+}
+
 function parseState(raw) {
     try {
         const p = JSON.parse(raw || "{}");
@@ -1115,6 +1169,10 @@ function parseState(raw) {
             // of entering the backend again to resume the checkpoint.
             resume_nonce: String(payload?.resume_nonce || ""),
             manual_resolution: normalizedManualResolution(payload?.manual_resolution),
+            continue_existing_video: normalizeMediaDescriptor(payload?.continue_existing_video, "video"),
+            continue_video_resize: payload?.continue_video_resize && typeof payload.continue_video_resize === "object"
+                ? normalizedContinueVideoResize(payload.continue_video_resize)
+                : null,
             clips: activeClips,
             mode_clips: {
                 ref2va: ref2vaClips,
@@ -1132,6 +1190,8 @@ function parseState(raw) {
         prompt_pack_signature: "",
         resume_nonce: "",
         manual_resolution: null,
+        continue_existing_video: null,
+        continue_video_resize: null,
         clips: ref2vaClips,
         mode_clips: { ref2va: ref2vaClips, fl2va: blankModeClips() },
     };
@@ -1152,6 +1212,9 @@ function serializeState(state) {
             fl2va: state.mode_clips.fl2va,
         },
     };
+    const sourceVideo = continueVideoDescriptor(state);
+    if (sourceVideo) payload.continue_existing_video = sourceVideo;
+    if (state?.continue_video_resize) payload.continue_video_resize = normalizedContinueVideoResize(state.continue_video_resize);
     const manualResolution = normalizedManualResolution(state?.manual_resolution);
     if (manualResolution) payload.manual_resolution = manualResolution;
     if (state?.load_token) payload.project_load_token = String(state.load_token);
@@ -1174,6 +1237,9 @@ function serializeProjectState(state) {
         causal_lineage: Array.isArray(state?.causal_lineage) ? state.causal_lineage.map(String) : [],
         clips: state.clips,
     };
+    const sourceVideo = continueVideoDescriptor(state);
+    if (sourceVideo) payload.continue_existing_video = sourceVideo;
+    if (state?.continue_video_resize) payload.continue_video_resize = normalizedContinueVideoResize(state.continue_video_resize);
     if (state?.load_token) payload.project_load_token = String(state.load_token);
     if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
     if (state?.resume_nonce) payload.resume_nonce = String(state.resume_nonce);
@@ -1202,6 +1268,11 @@ function mergeActiveStateJson(runtime, raw, explicitMode = null) {
     runtime.state.resume_nonce = incoming.resume_nonce || runtime.state.resume_nonce || "";
     runtime.state.manual_resolution = normalizedManualResolution(incoming.manual_resolution)
         || normalizedManualResolution(runtime.state.manual_resolution);
+    runtime.state.continue_existing_video = continueVideoDescriptor(incoming)
+        || continueVideoDescriptor(runtime.state);
+    if (incoming.continue_video_resize) {
+        runtime.state.continue_video_resize = normalizedContinueVideoResize(incoming.continue_video_resize);
+    }
     return runtime.state;
 }
 
@@ -1593,6 +1664,28 @@ function persistManualResolutionFallback(node, runtime) {
 function syncResolutionMirror(node, runtime) {
     if (!node || !runtime) return;
 
+    const sourceVideo = activeContinueVideoDescriptor(runtime);
+    const sourceWorking = continueVideoWorkingResolution(runtime, sourceVideo);
+    if (sourceVideo) {
+        runtime.resolutionGuide = "clip_0";
+        runtime.guideSourceWidth = Number(sourceVideo.width);
+        runtime.guideSourceHeight = Number(sourceVideo.height);
+        runtime.resolutionFallback = false;
+        runtime.resolutionMirrorActive = Boolean(sourceWorking?.compatible);
+        if (sourceWorking?.compatible) {
+            setResolutionMirrorValues(node, runtime, sourceWorking.width, sourceWorking.height);
+            runtime.resolvedWidth = Number(sourceWorking.width);
+            runtime.resolvedHeight = Number(sourceWorking.height);
+            runtime.expectedResolution = { width: Number(sourceWorking.width), height: Number(sourceWorking.height) };
+        } else {
+            runtime.resolvedWidth = 0;
+            runtime.resolvedHeight = 0;
+            runtime.expectedResolution = null;
+        }
+        node.graph?.setDirtyCanvas(true, true);
+        return;
+    }
+
     const mode = String(getWidget(node, "resolution_mode")?.value || "auto_from_ref");
     const widthWidget = getWidget(node, "width");
     const heightWidget = getWidget(node, "height");
@@ -1673,6 +1766,10 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
 
     wrap(widthWidget, (value) => {
         if (runtime.applyingResolutionMirror) return;
+        if (continueVideoDescriptor(runtime?.state)) {
+            requestAnimationFrame(() => syncResolutionMirror(node, runtime));
+            return;
+        }
         const mode = String(modeWidget?.value || "auto_from_ref");
         if (mode === "manual" || !hasAutoResolutionGuide(runtime)) {
             // Manual edits update the independent fallback geometry.
@@ -1691,6 +1788,10 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
     });
     wrap(heightWidget, (value) => {
         if (runtime.applyingResolutionMirror) return;
+        if (continueVideoDescriptor(runtime?.state)) {
+            requestAnimationFrame(() => syncResolutionMirror(node, runtime));
+            return;
+        }
         const mode = String(modeWidget?.value || "auto_from_ref");
         if (mode === "manual" || !hasAutoResolutionGuide(runtime)) {
             runtime.projectResolutionLoaded = false;
@@ -1707,6 +1808,10 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         }
     });
     wrap(modeWidget, (value) => {
+        if (continueVideoDescriptor(runtime?.state)) {
+            requestAnimationFrame(() => syncResolutionMirror(node, runtime));
+            return;
+        }
         runtime.projectResolutionLoaded = false;
         const mode = String(value || modeWidget?.value || "auto_from_ref");
         if (mode === "auto_from_ref" && !runtime.resolutionMirrorActive) {
@@ -1725,6 +1830,10 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
     });
     wrap(mpWidget, () => {
+        if (continueVideoDescriptor(runtime?.state)) {
+            requestAnimationFrame(() => syncResolutionMirror(node, runtime));
+            return;
+        }
         // Compatibility guard for older runtimes that may still carry the
         // one-shot projectResolutionLoaded flag. Megapixels is an Auto-only
         // control, so an explicit edit releases that legacy lock.
@@ -1765,6 +1874,30 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
             .lg-node-widget:has([aria-label="audio_context_length"]),
         [data-node-id]:has([data-h3-hide-context-widgets="1"])
             .lg-node-widget:has([name="audio_context_length"]) {
+            display: none !important;
+        }
+
+        /* Clip 0 owns project geometry. While an existing-video continuation is
+           active, hide the editable resolution controls in Nodes 2.0. Legacy
+           receives the same visibility state through setNativeWidgetVisibility(). */
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="resolution_mode"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([aria-label="resolution_mode"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([name="resolution_mode"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([aria-label="megapixels"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([name="megapixels"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([aria-label="width"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([name="width"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([aria-label="height"]),
+        [data-node-id]:has([data-h3-hide-resolution-widgets="1"])
+            .lg-node-widget:has([name="height"]) {
             display: none !important;
         }
     `;
@@ -1881,12 +2014,17 @@ function syncModeSpecificNativeWidgets(node, runtime) {
     // widget store. Publish the same state on our per-node DOM root; the scoped
     // CSS above then removes exactly the two native context rows for this node.
     // Legacy keeps using setNativeWidgetVisibility() below unchanged.
+    const sourceLocked = Boolean(activeContinueVideoDescriptor(runtime));
     if (runtime?.root) {
         runtime.root.dataset.h3HideContextWidgets = causalRef2va ? "0" : "1";
+        runtime.root.dataset.h3HideResolutionWidgets = sourceLocked ? "1" : "0";
     }
 
     setNativeWidgetVisibility(node, runtime?.contextLengthWidget, causalRef2va);
     setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, causalRef2va);
+    for (const name of ["resolution_mode", "megapixels", "width", "height"]) {
+        setNativeWidgetVisibility(node, getWidget(node, name), !sourceLocked);
+    }
 }
 
 function domWidgetRenderMode(element) {
@@ -2702,16 +2840,16 @@ function singleSystemImageFileFromDropEvent(event) {
 }
 
 async function uploadReference(node, runtime, slotIndex, file) {
-    if (!node || !runtime || !file) return;
+    if (!node || !runtime || !file) return false;
     if (projectBusy(runtime)) {
         alert("Wait for the current clip generation to finish before changing a reference image.");
-        return;
+        return false;
     }
     const logicalSlot = Number(slotIndex) + 1;
     if (localSlotReservations(runtime, "picture").has(logicalSlot)) {
         alert(`Picture ${logicalSlot} is reserved by a clip-local reference. Remove the local reference first.`);
         render(node, runtime);
-        return;
+        return false;
     }
 
     runtime.refBusy = true;
@@ -2737,15 +2875,17 @@ async function uploadReference(node, runtime, slotIndex, file) {
             updateRefsHidden(node, runtime);
             runtime.statusText = `Ref ${slotIndex + 1} unchanged`;
             render(node, runtime);
-            return;
+            return true;
         }
 
         runtime.refsState.refs[slotIndex] = newRef;
         handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} loaded`);
+        return true;
     } catch (error) {
         runtime.statusText = "Reference load failed";
         render(node, runtime);
         alert(String(error?.message || error));
+        return false;
     } finally {
         runtime.refBusy = false;
         render(node, runtime);
@@ -2790,6 +2930,804 @@ async function uploadLocalPicture(node, runtime, clipIndex, file) {
         runtime.refBusy = false;
         render(node, runtime);
     }
+}
+
+function formatClip0Duration(seconds) {
+    const value = Math.max(0, Number(seconds || 0));
+    const total = Math.floor(value);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    const ms = Math.round((value - total) * 10);
+    if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${ms}`;
+    return `${minutes}:${String(secs).padStart(2, "0")}.${ms}`;
+}
+
+function resetClip0RuntimeState(node, runtime, sourceVideo, message) {
+    for (const clip of runtime?.state?.clips || []) clip.validated = false;
+    runtime.cachedClipIds = new Set();
+    runtime.validatedClipIds = new Set();
+    runtime.computedIndices = new Set();
+    runtime.computedClipIds = new Set();
+    runtime.cachedCount = 0;
+    runtime.validatedCount = 0;
+    runtime.checkpointActive = false;
+    runtime.checkpointInterrupted = false;
+    runtime.checkpointSnapshotCount = 0;
+    runtime.cacheStateRestored = true;
+    runtime.resolutionInvalidated = false;
+    const sourceWorking = sourceVideo ? continueVideoWorkingResolution(runtime, sourceVideo) : null;
+    runtime.expectedResolution = sourceWorking?.compatible
+        ? { width: Number(sourceWorking.width), height: Number(sourceWorking.height) }
+        : null;
+    runtime.resolvedWidth = sourceWorking?.compatible ? Number(sourceWorking.width) : 0;
+    runtime.resolvedHeight = sourceWorking?.compatible ? Number(sourceWorking.height) : 0;
+    runtime.resolutionGuide = sourceVideo ? "clip_0" : "";
+    runtime.guideSourceWidth = sourceVideo ? Number(sourceVideo.width) : 0;
+    runtime.guideSourceHeight = sourceVideo ? Number(sourceVideo.height) : 0;
+    runtime.resolutionFallback = false;
+    runtime.resolutionMirrorActive = Boolean(sourceVideo);
+    runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
+    runtime.statusText = String(message || "Clip 0 changed | generated chain invalidated");
+    updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
+    syncModeSpecificNativeWidgets(node, runtime);
+    syncResolutionMirror(node, runtime);
+    render(node, runtime);
+    syncDomHeight(node, runtime, false);
+    node.graph?.setDirtyCanvas(true, true);
+    window.dispatchEvent(new CustomEvent("h3-extender-source-changed", {
+        detail: { owner_id: String(node?.id ?? "") },
+    }));
+}
+
+async function resetContinueVideoCache(node, runtime) {
+    const response = await fetch(api.apiURL("/h3_extender/continue_video/reset_cache"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner_id: String(node?.id ?? "") }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error || `Clip 0 cache reset failed (${response.status}).`);
+    }
+    return payload;
+}
+
+async function clearContinueVideoAfterDisconnect(node, runtime) {
+    if (!node || !runtime || !activeContinueVideoDescriptor(runtime)) return;
+    if (projectBusy(runtime) || runtime.projectOperationBusy) {
+        runtime.statusText = "continue_existing_video disconnected; queue again after the current operation finishes";
+        render(node, runtime);
+        return;
+    }
+    try {
+        await resetContinueVideoCache(node, runtime);
+    } catch (error) {
+        console.warn("[MiniMax H3 Extender] Failed to reset Clip 0 cache after VIDEO disconnect", error);
+    }
+    runtime.state.continue_existing_video = null;
+    runtime.continueVideoPreviewMeta = null;
+    runtime.continueVideoProbeKey = "";
+    runtime.continueVideoProbeEpoch = Number(runtime.continueVideoProbeEpoch || 0) + 1;
+    resetClip0RuntimeState(node, runtime, null, "Clip 0 disconnected | generated chain invalidated");
+}
+
+function graphNodeById(graph, nodeId) {
+    if (!graph || nodeId === null || nodeId === undefined) return null;
+    try {
+        if (typeof graph.getNodeById === "function") {
+            const found = graph.getNodeById(nodeId);
+            if (found) return found;
+        }
+    } catch (_) {}
+    for (const candidate of graph._nodes || []) {
+        if (String(candidate?.id) === String(nodeId)) return candidate;
+    }
+    return null;
+}
+
+function continueVideoUpstreamSelection(node) {
+    const entry = findInputEntry(node, "continue_existing_video");
+    if (!entry || !inputConnected(entry.input)) return null;
+
+    const link = inputLinkAtSlot(node, entry.slot, graphIncomingLinksBySlot(node));
+    if (!link) return { supported: false, key: "connected:no-link", file: "" };
+    const originId = link.origin_id ?? link.originId;
+    const sourceNode = graphNodeById(node.graph, originId);
+    if (!sourceNode) return { supported: false, key: `connected:${String(originId ?? "unknown")}`, file: "" };
+
+    const sourceType = String(sourceNode.comfyClass || sourceNode.type || "");
+    const fileWidget = (sourceNode.widgets || []).find((widget) =>
+        String(widget?.name || "") === "file" || String(widget?.name || "") === "video"
+    );
+    const file = String(fileWidget?.value || "").trim();
+    const supported = sourceType === "LoadVideo" && Boolean(file);
+    return {
+        supported,
+        sourceType,
+        file,
+        key: `${String(originId ?? "unknown")}:${sourceType}:${file}`,
+    };
+}
+
+function clip0ReferenceTargetSlots(runtime) {
+    const reserved = localSlotReservations(runtime, "picture");
+    const refs = normalizeRefsArray(runtime?.refsState?.refs || []);
+    const slots = [];
+    for (let index = 0; index < MAX_IMAGE_REFS; index++) {
+        const logicalSlot = index + 1;
+        if (reserved.has(logicalSlot)) continue;
+        slots.push({ index, ref: refs[index] || null });
+    }
+    return slots;
+}
+
+function continueVideoFramePickerUrl(node, runtime) {
+    const selection = continueVideoUpstreamSelection(node);
+    if (selection?.supported && selection.file) {
+        const params = new URLSearchParams();
+        params.set("file", selection.file);
+        return api.apiURL("/h3_extender/continue_video/source?" + params.toString());
+    }
+    const persisted = continueVideoDescriptor(runtime?.state);
+    return persisted ? localMediaPreviewUrl(persisted) : "";
+}
+
+function canvasPngBlob(canvas) {
+    return new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+            if (blob) resolve(blob);
+            else reject(new Error("Could not capture the selected Clip 0 frame."));
+        }, "image/png");
+    });
+}
+
+function openClip0ReferencePicker(node, runtime) {
+    const source = activeContinueVideoDescriptor(runtime);
+    if (!node || !runtime || !source) return;
+    if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
+        alert("Wait for the current operation to finish before choosing a Clip 0 reference frame.");
+        return;
+    }
+
+    const targets = clip0ReferenceTargetSlots(runtime);
+    if (!targets.length) {
+        alert("All Picture slots are reserved by clip-local references. Free a Picture slot before choosing a Clip 0 reference frame.");
+        return;
+    }
+    const playerUrl = continueVideoFramePickerUrl(node, runtime);
+    if (!playerUrl) {
+        alert("Clip 0 source video is not available to the frame picker yet.");
+        return;
+    }
+
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.zIndex = "100000";
+    overlay.style.background = "rgba(0,0,0,.88)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.padding = "24px";
+    overlay.style.boxSizing = "border-box";
+
+    const panel = document.createElement("div");
+    panel.style.width = "min(1180px, 95vw)";
+    panel.style.height = "min(820px, 92vh)";
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.background = "#171717";
+    panel.style.border = "1px solid rgba(255,255,255,.18)";
+    panel.style.borderRadius = "10px";
+    panel.style.boxShadow = "0 18px 60px rgba(0,0,0,.68)";
+    panel.style.overflow = "hidden";
+    overlay.appendChild(panel);
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.gap = "10px";
+    header.style.padding = "10px 12px";
+    header.style.borderBottom = "1px solid rgba(255,255,255,.12)";
+    const title = document.createElement("strong");
+    title.textContent = "Clip 0 — Choose Reference Frame";
+    title.style.flex = "1 1 auto";
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "×";
+    closeButton.title = "Close";
+    closeButton.style.width = "28px";
+    closeButton.style.minWidth = "28px";
+    closeButton.style.height = "26px";
+    closeButton.style.padding = "0";
+    closeButton.style.fontSize = "18px";
+    header.append(title, closeButton);
+    panel.appendChild(header);
+
+    const body = document.createElement("div");
+    body.style.flex = "1 1 auto";
+    body.style.minHeight = "0";
+    body.style.display = "flex";
+    body.style.flexDirection = "column";
+    body.style.padding = "12px";
+    body.style.gap = "10px";
+    panel.appendChild(body);
+
+    const videoWrap = document.createElement("div");
+    videoWrap.style.flex = "1 1 auto";
+    videoWrap.style.minHeight = "0";
+    videoWrap.style.display = "flex";
+    videoWrap.style.alignItems = "center";
+    videoWrap.style.justifyContent = "center";
+    videoWrap.style.background = "#090909";
+    videoWrap.style.borderRadius = "7px";
+    videoWrap.style.overflow = "hidden";
+    const video = document.createElement("video");
+    video.src = playerUrl;
+    video.controls = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    video.style.width = "100%";
+    video.style.height = "100%";
+    video.style.objectFit = "contain";
+    videoWrap.appendChild(video);
+    body.appendChild(videoWrap);
+
+    const infoRow = document.createElement("div");
+    infoRow.style.display = "flex";
+    infoRow.style.alignItems = "center";
+    infoRow.style.gap = "8px";
+    infoRow.style.fontSize = "11px";
+    const timeLabel = document.createElement("span");
+    timeLabel.style.opacity = ".75";
+    timeLabel.style.minWidth = "155px";
+    const backFrame = document.createElement("button");
+    backFrame.textContent = "−1 frame";
+    const nextFrame = document.createElement("button");
+    nextFrame.textContent = "+1 frame";
+    infoRow.append(timeLabel, backFrame, nextFrame);
+    body.appendChild(infoRow);
+
+    const controls = document.createElement("div");
+    controls.style.display = "flex";
+    controls.style.alignItems = "center";
+    controls.style.gap = "8px";
+    controls.style.paddingTop = "8px";
+    controls.style.borderTop = "1px solid rgba(255,255,255,.12)";
+    const targetLabel = document.createElement("span");
+    targetLabel.textContent = "Target";
+    targetLabel.style.fontSize = "11px";
+    targetLabel.style.opacity = ".72";
+    const select = document.createElement("select");
+    select.style.minWidth = "220px";
+    const defaultTarget = targets.find((item) => !item.ref) || targets[0];
+    for (const item of targets) {
+        const option = document.createElement("option");
+        option.value = String(item.index);
+        option.selected = item.index === defaultTarget.index;
+        option.textContent = item.ref
+            ? `Ref ${item.index + 1} (<Picture ${item.index + 1}>) — replace ${item.ref.original_name || "current image"}`
+            : `Ref ${item.index + 1} (<Picture ${item.index + 1}>) — empty`;
+        select.appendChild(option);
+    }
+    const spacer = document.createElement("div");
+    spacer.style.flex = "1 1 auto";
+    const useButton = document.createElement("button");
+    useButton.style.fontWeight = "650";
+    controls.append(targetLabel, select, spacer, useButton);
+    body.appendChild(controls);
+
+    const refreshUseLabel = () => {
+        const index = Math.max(0, Math.trunc(Number(select.value) || 0));
+        useButton.textContent = `Use frame as Ref ${index + 1}`;
+        useButton.title = `The captured frame becomes the normal canonical <Picture ${index + 1}> reference.`;
+    };
+    refreshUseLabel();
+    select.addEventListener("change", refreshUseLabel);
+
+    const refreshTime = () => {
+        const current = Math.max(0, Number(video.currentTime || 0));
+        const duration = Number.isFinite(video.duration) ? Math.max(0, Number(video.duration)) : Number(source.duration || 0);
+        const fps = Number(source.fps || 0) > 0 ? Number(source.fps) : 24;
+        const frame = Math.max(0, Math.round(current * fps));
+        timeLabel.textContent = `${formatClip0Duration(current)} / ${formatClip0Duration(duration)} • frame ~${frame}`;
+    };
+    const stepFrame = (direction) => {
+        const fps = Number(source.fps || 0) > 0 ? Number(source.fps) : 24;
+        const duration = Number.isFinite(video.duration) ? Math.max(0, Number(video.duration)) : Number(source.duration || 0);
+        const next = Math.max(0, Math.min(duration || Number.MAX_SAFE_INTEGER, Number(video.currentTime || 0) + (Number(direction) / fps)));
+        video.pause();
+        video.currentTime = next;
+    };
+    backFrame.addEventListener("click", () => stepFrame(-1));
+    nextFrame.addEventListener("click", () => stepFrame(1));
+    video.addEventListener("loadedmetadata", refreshTime);
+    video.addEventListener("timeupdate", refreshTime);
+    video.addEventListener("seeked", refreshTime);
+
+    let closed = false;
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        try {
+            video.pause();
+            video.removeAttribute("src");
+            video.load();
+        } catch (_) {}
+        overlay.remove();
+    };
+    closeButton.addEventListener("click", close);
+    overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) close();
+    });
+
+    useButton.addEventListener("click", async () => {
+        const slotIndex = Math.max(0, Math.min(MAX_IMAGE_REFS - 1, Math.trunc(Number(select.value) || 0)));
+        if (!Number(video.videoWidth || 0) || !Number(video.videoHeight || 0) || Number(video.readyState || 0) < 2) {
+            alert("Seek to a decoded video frame before using it as a reference.");
+            return;
+        }
+        useButton.disabled = true;
+        select.disabled = true;
+        backFrame.disabled = true;
+        nextFrame.disabled = true;
+        try {
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.max(1, Math.trunc(Number(video.videoWidth)));
+            canvas.height = Math.max(1, Math.trunc(Number(video.videoHeight)));
+            const ctx = canvas.getContext("2d", { alpha: false });
+            if (!ctx) throw new Error("Canvas capture is unavailable in this browser.");
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const blob = await canvasPngBlob(canvas);
+            const timestampMs = Math.max(0, Math.round(Number(video.currentTime || 0) * 1000));
+            const file = new File([blob], `clip0_ref_${String(timestampMs).padStart(8, "0")}ms.png`, { type: "image/png" });
+            const ok = await uploadReference(node, runtime, slotIndex, file);
+            if (!ok) return;
+            runtime.statusText = `Clip 0 frame ${formatClip0Duration(video.currentTime)} loaded as Ref ${slotIndex + 1} (<Picture ${slotIndex + 1}>)`;
+            render(node, runtime);
+            close();
+        } catch (error) {
+            runtime.statusText = "Clip 0 reference capture failed";
+            render(node, runtime);
+            alert(String(error?.message || error));
+        } finally {
+            if (!closed) {
+                useButton.disabled = false;
+                select.disabled = false;
+                backFrame.disabled = false;
+                nextFrame.disabled = false;
+            }
+        }
+    });
+
+    document.body.appendChild(overlay);
+    video.load();
+}
+
+function sameContinueVideoPreviewMetadata(a, b) {
+    const left = normalizeMediaDescriptor(a, "video");
+    const right = normalizeMediaDescriptor(b, "video");
+    if (!left || !right) return false;
+    const close = (x, y, tolerance = 1e-3) => Math.abs(Number(x || 0) - Number(y || 0)) <= tolerance;
+    return (
+        String(left.original_name || "") === String(right.original_name || "")
+        && Number(left.size_bytes || 0) === Number(right.size_bytes || 0)
+        && Number(left.width || 0) === Number(right.width || 0)
+        && Number(left.height || 0) === Number(right.height || 0)
+        && close(left.fps, right.fps)
+        && close(left.duration, right.duration, 0.02)
+        && Boolean(left.has_audio) === Boolean(right.has_audio)
+    );
+}
+
+async function probeConnectedContinueVideo(node, runtime) {
+    if (!node || !runtime) return;
+    const selection = continueVideoUpstreamSelection(node);
+    if (!selection) return;
+
+    if (!selection.supported) {
+        runtime.continueVideoProbeKey = selection.key || "";
+        runtime.continueVideoPreviewMeta = null;
+        if (!continueVideoDescriptor(runtime.state)) {
+            runtime.statusText = selection.sourceType && selection.sourceType !== "LoadVideo"
+                ? "Clip 0 metadata appears after Queue for non-native VIDEO sources"
+                : "Select a file in native Load Video to inspect Clip 0";
+            render(node, runtime);
+        }
+        return;
+    }
+
+    if (
+        runtime.continueVideoProbeKey === selection.key
+        && runtime.continueVideoPreviewMeta
+        && !runtime.continueVideoProbeBusy
+    ) return;
+
+    const epoch = Number(runtime.continueVideoProbeEpoch || 0) + 1;
+    runtime.continueVideoProbeEpoch = epoch;
+    runtime.continueVideoProbeBusy = true;
+    runtime.statusText = "Reading Clip 0 metadata…";
+    render(node, runtime);
+
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/continue_video/probe"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file: selection.file }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Clip 0 metadata probe failed (${response.status}).`);
+        }
+
+        if (epoch !== Number(runtime.continueVideoProbeEpoch || 0)) return;
+        const latest = continueVideoUpstreamSelection(node);
+        if (!latest || latest.key !== selection.key) return;
+
+        const preview = normalizeMediaDescriptor(payload.video, "video");
+        if (!preview) throw new Error("Clip 0 metadata probe returned an invalid video descriptor.");
+
+        const persisted = continueVideoDescriptor(runtime.state);
+        const sameSource = persisted && sameContinueVideoPreviewMetadata(persisted, preview);
+        runtime.continueVideoPreviewMeta = preview;
+        runtime.continueVideoProbeKey = selection.key;
+
+        if (!sameSource) {
+            // The probe is display-only. Never serialize its synthetic id into
+            // clips_json; the real descriptor is written only after Queue when
+            // ComfyUI provides the actual VIDEO object to the backend.
+            runtime.state.continue_existing_video = null;
+            try {
+                await resetContinueVideoCache(node, runtime);
+            } catch (error) {
+                console.warn("[MiniMax H3 Extender] Failed to reset Clip 0 cache after VIDEO connect/change", error);
+            }
+            resetClip0RuntimeState(
+                node,
+                runtime,
+                preview,
+                `Clip 0 connected • ${Math.trunc(preview.width)}x${Math.trunc(preview.height)} @ ${Number(preview.fps || 0).toFixed(3)} fps`,
+            );
+        } else {
+            syncResolutionMirror(node, runtime);
+            runtime.statusText = `Clip 0 connected • ${Math.trunc(preview.width)}x${Math.trunc(preview.height)} @ ${Number(preview.fps || 0).toFixed(3)} fps`;
+            render(node, runtime);
+            syncDomHeight(node, runtime, false);
+            node.graph?.setDirtyCanvas(true, true);
+        }
+    } catch (error) {
+        if (epoch === Number(runtime.continueVideoProbeEpoch || 0)) {
+            runtime.continueVideoPreviewMeta = null;
+            runtime.statusText = `Clip 0 metadata failed: ${String(error?.message || error)}`;
+            render(node, runtime);
+        }
+    } finally {
+        if (epoch === Number(runtime.continueVideoProbeEpoch || 0)) {
+            runtime.continueVideoProbeBusy = false;
+        }
+    }
+}
+
+function invalidateAllGeneratedStateForContinueModeSwitch(runtime) {
+    if (!runtime?.state) return;
+    ensureModeClipState(runtime.state);
+    for (const mode of ["ref2va", "fl2va"]) {
+        for (const clip of runtime.state.mode_clips?.[mode] || []) {
+            clip.validated = false;
+        }
+    }
+    for (const clip of runtime.state.clips || []) clip.validated = false;
+    runtime.modeValidationState = {};
+    runtime.modeValidationOrder = {};
+    runtime.cachedClipIds = new Set();
+    runtime.validatedClipIds = new Set();
+    runtime.computedIndices = new Set();
+    runtime.computedClipIds = new Set();
+    runtime.cachedCount = 0;
+    runtime.validatedCount = 0;
+    runtime.checkpointActive = false;
+    runtime.checkpointInterrupted = false;
+    runtime.checkpointSnapshotCount = 0;
+    runtime.cacheStateRestored = false;
+    runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
+}
+
+async function invalidateContinueVideoModeCaches(node, runtime, generationMode, motionContext) {
+    const response = await fetch(api.apiURL("/h3_extender/continue_video/invalidate_modes"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            owner_id: String(node?.id ?? ""),
+            generation_mode: String(generationMode || "ref2va"),
+            motion_context: motionContext !== false,
+        }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error || `Clip 0 mode invalidation failed (${response.status}).`);
+    }
+    return payload;
+}
+
+function refreshContinueVideoSocketState(node, runtime) {
+    if (!node || !runtime) return;
+    const entry = findInputEntry(node, "continue_existing_video");
+    const connected = Boolean(entry && inputConnected(entry.input));
+    const wasConnected = Boolean(runtime.continueVideoSocketConnected);
+    runtime.continueVideoSocketConnected = connected;
+    if (!connected) {
+        runtime.continueVideoProbeEpoch = Number(runtime.continueVideoProbeEpoch || 0) + 1;
+        if (wasConnected || activeContinueVideoDescriptor(runtime)) {
+            void clearContinueVideoAfterDisconnect(node, runtime);
+        }
+        return;
+    }
+
+    // Clip 0 bootstraps only the first generated clip. The user's active mode
+    // remains authoritative for Clip 1 -> Clip 2+ (Motion ON, Motion OFF or
+    // FL2VA), so connecting a VIDEO never changes generation mode by itself.
+    void probeConnectedContinueVideo(node, runtime);
+}
+
+async function applyContinueVideoResizeSettings(node, runtime, nextResize) {
+    if (!node || !runtime?.state) return;
+    const source = activeContinueVideoDescriptor(runtime);
+    if (!source) return;
+
+    const before = continueVideoWorkingResolution(runtime, source);
+    runtime.state.continue_video_resize = normalizedContinueVideoResize(nextResize);
+    const resize = runtime.state.continue_video_resize;
+    const after = continueVideoWorkingResolution(runtime, source);
+    if (resize.mode === "auto") {
+        const mpWidget = getWidget(node, "megapixels");
+        if (mpWidget) mpWidget.value = resize.megapixels;
+    } else if (resize.mode === "manual") {
+        const widthWidget = getWidget(node, "width");
+        const heightWidget = getWidget(node, "height");
+        if (widthWidget) widthWidget.value = resize.width;
+        if (heightWidget) heightWidget.value = resize.height;
+    }
+
+    updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
+    syncResolutionMirror(node, runtime);
+
+    const sameWorkingGeometry = Boolean(
+        before?.compatible && after?.compatible
+        && Number(before.width) === Number(after.width)
+        && Number(before.height) === Number(after.height)
+    );
+    if (sameWorkingGeometry) {
+        runtime.statusText = `Clip 0 working resolution • ${Math.trunc(after.width)}x${Math.trunc(after.height)}`;
+        render(node, runtime);
+        syncDomHeight(node, runtime, false);
+        node.graph?.setDirtyCanvas(true, true);
+        return;
+    }
+
+    runtime.statusText = "Clip 0 resize changed • invalidating generated chain…";
+    render(node, runtime);
+
+    try {
+        await resetContinueVideoCache(node, runtime);
+        resetClip0RuntimeState(node, runtime, source, "Clip 0 resize changed | generated chain invalidated");
+    } catch (error) {
+        console.warn("[MiniMax H3 Extender] Failed to reset Clip 0 cache after resize change", error);
+        resetClip0RuntimeState(node, runtime, source, "Clip 0 resize changed | cache will be checked on Queue");
+    }
+}
+
+function renderContinueVideoCard(node, runtime) {
+    const source = activeContinueVideoDescriptor(runtime);
+    if (!source || !runtime?.cards) return;
+
+    const card = document.createElement("div");
+    card.className = "h3-extender-card h3-extender-source-card";
+    card.dataset.clipIndex = "source";
+    card.style.flex = `0 0 ${CARD_WIDTH}px`;
+    card.style.width = `${CARD_WIDTH}px`;
+    card.style.boxSizing = "border-box";
+    card.style.padding = "9px";
+    card.style.borderRadius = "8px";
+    card.style.background = "rgba(24,34,42,.82)";
+    card.style.border = "2px solid rgba(90,175,235,.78)";
+    card.style.display = "flex";
+    card.style.flexDirection = "column";
+    card.style.minHeight = `${cardMinHeightForState(runtime.state)}px`;
+
+    const head = document.createElement("div");
+    head.style.display = "flex";
+    head.style.alignItems = "center";
+    head.style.gap = "7px";
+    head.style.marginBottom = "8px";
+    const title = document.createElement("strong");
+    title.textContent = "CLIP 0 — EXISTING VIDEO";
+    title.style.flex = "1 1 auto";
+    title.style.whiteSpace = "nowrap";
+    const locked = document.createElement("span");
+    locked.textContent = "LOCKED";
+    locked.style.fontSize = "9px";
+    locked.style.opacity = ".72";
+    locked.style.border = "1px solid rgba(255,255,255,.22)";
+    locked.style.borderRadius = "4px";
+    locked.style.padding = "2px 4px";
+    head.append(title, locked);
+    card.appendChild(head);
+
+    const name = document.createElement("div");
+    name.textContent = source.original_name || "Existing video";
+    name.title = source.original_name || "";
+    name.style.fontSize = "12px";
+    name.style.fontWeight = "600";
+    name.style.whiteSpace = "nowrap";
+    name.style.overflow = "hidden";
+    name.style.textOverflow = "ellipsis";
+    name.style.marginBottom = "8px";
+    card.appendChild(name);
+
+    const chooseRef = document.createElement("button");
+    chooseRef.textContent = "Choose Ref";
+    chooseRef.title = "Open Clip 0, choose a frame, and load it into a normal canonical Picture reference slot.";
+    chooseRef.style.width = "100%";
+    chooseRef.style.marginBottom = "8px";
+    chooseRef.style.fontSize = "11px";
+    chooseRef.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+    chooseRef.addEventListener("click", (event) => {
+        event.preventDefault();
+        if (!chooseRef.disabled) openClip0ReferencePicker(node, runtime);
+    });
+    card.appendChild(chooseRef);
+
+    const frameCount = source.frame_count > 0
+        ? source.frame_count
+        : (source.duration > 0 && source.fps > 0 ? Math.round(source.duration * source.fps) : 0);
+    const resize = normalizedContinueVideoResize(runtime.state?.continue_video_resize);
+    const working = continueVideoWorkingResolution(runtime, source);
+    const workingText = working?.compatible
+        ? `${Math.trunc(working.width)} × ${Math.trunc(working.height)}`
+        : "Incompatible — choose Auto / MP or Manual";
+    const rows = [
+        ["Source", `${Math.trunc(source.width)} × ${Math.trunc(source.height)}`],
+        ["Working", workingText],
+        ["FPS", source.fps > 0 ? `${source.fps.toFixed(3)} source → 24 working` : "24 working"],
+        ["Duration", formatClip0Duration(source.duration)],
+        ["Source frames", frameCount > 0 ? String(frameCount) : "—"],
+        ["Audio", source.has_audio ? "Yes" : "No"],
+    ];
+    if (source.video_codec) rows.push(["Video codec", source.video_codec]);
+    if (source.audio_codec) rows.push(["Audio codec", source.audio_codec]);
+    for (const [label, value] of rows) {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.justifyContent = "space-between";
+        row.style.gap = "8px";
+        row.style.fontSize = "11px";
+        row.style.marginBottom = "5px";
+        const l = document.createElement("span");
+        l.textContent = label;
+        l.style.opacity = ".65";
+        const v = document.createElement("span");
+        v.textContent = value;
+        v.style.textAlign = "right";
+        v.style.overflow = "hidden";
+        v.style.textOverflow = "ellipsis";
+        row.append(l, v);
+        card.appendChild(row);
+    }
+
+    const resizeBox = document.createElement("div");
+    resizeBox.style.marginTop = "7px";
+    resizeBox.style.paddingTop = "7px";
+    resizeBox.style.borderTop = "1px solid rgba(255,255,255,.12)";
+
+    const resizeHead = document.createElement("div");
+    resizeHead.textContent = "Working resize";
+    resizeHead.style.fontSize = "10px";
+    resizeHead.style.fontWeight = "700";
+    resizeHead.style.opacity = ".78";
+    resizeHead.style.marginBottom = "5px";
+    resizeBox.appendChild(resizeHead);
+
+    const modeSelect = document.createElement("select");
+    modeSelect.style.width = "100%";
+    modeSelect.style.fontSize = "11px";
+    modeSelect.style.marginBottom = "5px";
+    modeSelect.title = "Resize only the disk working copy. The original source file remains unchanged.";
+    for (const [value, label] of [["original", "Original"], ["auto", "Auto / MP"], ["manual", "Manual"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        option.selected = resize.mode === value;
+        modeSelect.appendChild(option);
+    }
+    modeSelect.addEventListener("change", () => {
+        void applyContinueVideoResizeSettings(node, runtime, { ...resize, mode: modeSelect.value });
+    });
+    resizeBox.appendChild(modeSelect);
+
+    if (resize.mode === "auto") {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "6px";
+        const label = document.createElement("span");
+        label.textContent = "MP";
+        label.style.fontSize = "10px";
+        label.style.opacity = ".65";
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = "0.01";
+        input.max = "16";
+        input.step = "0.01";
+        input.value = Number(resize.megapixels).toFixed(2);
+        input.style.width = "78px";
+        input.style.marginLeft = "auto";
+        input.addEventListener("change", () => {
+            const value = Math.max(0.01, Math.min(16, Number(input.value) || DEFAULT_MEGAPIXELS));
+            void applyContinueVideoResizeSettings(node, runtime, { ...resize, megapixels: value });
+        });
+        row.append(label, input);
+        resizeBox.appendChild(row);
+    } else if (resize.mode === "manual") {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "5px";
+        const widthInput = document.createElement("input");
+        const heightInput = document.createElement("input");
+        for (const input of [widthInput, heightInput]) {
+            input.type = "number";
+            input.min = "32";
+            input.max = String(MAX_RESOLUTION);
+            input.step = "32";
+            input.style.width = "72px";
+            input.style.minWidth = "0";
+        }
+        widthInput.value = String(Math.trunc(resize.width));
+        heightInput.value = String(Math.trunc(resize.height));
+        const x = document.createElement("span");
+        x.textContent = "×";
+        x.style.opacity = ".55";
+        const commitManual = () => {
+            void applyContinueVideoResizeSettings(node, runtime, {
+                ...resize,
+                width: Math.max(32, Math.min(MAX_RESOLUTION, Number(widthInput.value) || resize.width)),
+                height: Math.max(32, Math.min(MAX_RESOLUTION, Number(heightInput.value) || resize.height)),
+            });
+        };
+        widthInput.addEventListener("change", commitManual);
+        heightInput.addEventListener("change", commitManual);
+        row.append(widthInput, x, heightInput);
+        resizeBox.appendChild(row);
+    } else if (working && !working.compatible) {
+        const warning = document.createElement("div");
+        warning.textContent = "Original size is not H3-compatible. Select Auto / MP or Manual.";
+        warning.style.fontSize = "10px";
+        warning.style.lineHeight = "1.3";
+        warning.style.opacity = ".78";
+        warning.style.marginTop = "3px";
+        resizeBox.appendChild(warning);
+    }
+
+    const resizeNote = document.createElement("div");
+    resizeNote.textContent = "Resize + 24 fps are applied together once to the disk working copy.";
+    resizeNote.style.fontSize = "9px";
+    resizeNote.style.opacity = ".55";
+    resizeNote.style.marginTop = "5px";
+    resizeNote.style.lineHeight = "1.25";
+    resizeBox.appendChild(resizeNote);
+    card.appendChild(resizeBox);
+
+    const explanation = document.createElement("div");
+    explanation.textContent = "Full Clip 0 is prepended to Preview/Final. Only its tail is VAE-encoded to bootstrap Clip 1 Motion Context.";
+    explanation.style.fontSize = "10px";
+    explanation.style.opacity = ".62";
+    explanation.style.marginTop = "7px";
+    explanation.style.lineHeight = "1.35";
+    card.appendChild(explanation);
+
+    runtime.cards.appendChild(card);
 }
 
 async function uploadLocalMedia(node, runtime, clipIndex, kind, file) {
@@ -3728,6 +4666,8 @@ function applyProjectPayload(node, runtime, projectPayload) {
     // visible setting happens to match the workflow that was previously run.
     runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
     updateHidden(node, runtime);
+    syncModeSpecificNativeWidgets(node, runtime);
+    syncResolutionMirror(node, runtime);
     captureNativeWorkflowState(node, runtime);
 
     const finalSettings = projectPayload?.final_decode?.settings;
@@ -3771,6 +4711,7 @@ function freshProjectState(runtime) {
             width: runtime?.manualWidth,
             height: runtime?.manualHeight,
         }),
+        continue_existing_video: null,
         clips: activeClips,
         mode_clips: { ref2va: ref2vaClips, fl2va: fl2vaClips },
     };
@@ -4700,6 +5641,7 @@ function render(node, runtime) {
             ? "Independent Ref2VA clips: no Motion Context; reruns and edits stay targeted"
             : "Causal Ref2VA chain: each clip receives Motion Context from the previous clip";
     }
+    const sourceVideo = activeContinueVideoDescriptor(runtime);
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = state.motion_context !== false;
     if (runtime.refsSection) runtime.refsSection.style.display = "block";
@@ -4712,8 +5654,12 @@ function render(node, runtime) {
     }
     counter.textContent = fl2vaMode
         ? `${state.clips.length} plan${state.clips.length > 1 ? "s" : ""} • FL2VA`
-        : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}${independentRef2va ? " • independent" : ""}`;
+        : sourceVideo
+            ? `Clip 0 + ${state.clips.length} generated • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`
+            : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}${independentRef2va ? " • independent" : ""}`;
     status.textContent = runtime.statusText || "Ready";
+
+    if (sourceVideo) renderContinueVideoCard(node, runtime);
 
     state.clips.forEach((clip, index) => {
         const card = document.createElement("div");
@@ -5931,6 +6877,10 @@ function finalizeRuntimeAfterGraphLoad(node, runtime) {
     runtime.hydrating = false;
     runtime.ready = true;
     hydrateRuntimeFromNativeWidgets(node, runtime, true);
+    // A VIDEO connection is graph state rather than a native widget value.
+    // Probe it only after ComfyUI has finished restoring links so F5/tab loads
+    // never race the existing hydration/socket-order protection.
+    setTimeout(() => { void refreshContinueVideoSocketState(node, runtime); }, 0);
 }
 
 function buildUi(node) {
@@ -5986,30 +6936,56 @@ function buildUi(node) {
 
     const modeButton = document.createElement("button");
     modeButton.title = "Switch between Ref2VA + Motion Context and independent FL2VA plans";
-    modeButton.addEventListener("click", (e) => {
+    modeButton.addEventListener("click", async (e) => {
         e.preventDefault();
         if (projectBusy(runtime)) return;
         const current = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
         const next = current === "fl2va" ? "ref2va" : "fl2va";
-        // REF2VA and FL2VA own completely independent card timelines. Store the
-        // active array before switching and restore the other mode's array;
-        // edits, insertions and deletions in one mode never mutate the other.
-        snapshotModeValidation(runtime);
-        activateModeState(runtime.state, next);
-        if (!restoreModeValidation(runtime)) {
-            for (const clip of runtime.state.clips) clip.validated = false;
+        const sourceActive = Boolean(runtime.continueVideoSocketConnected || activeContinueVideoDescriptor(runtime));
+
+        if (sourceActive) {
+            try {
+                await invalidateContinueVideoModeCaches(
+                    node,
+                    runtime,
+                    next,
+                    runtime.state?.motion_context !== false,
+                );
+            } catch (error) {
+                runtime.statusText = "Clip 0 mode switch failed";
+                render(node, runtime);
+                alert(String(error?.message || error));
+                return;
+            }
+            // Clip 0 is kept, but every generated clip/cache in every mode is
+            // invalid after changing generation semantics.
+            invalidateAllGeneratedStateForContinueModeSwitch(runtime);
+            activateModeState(runtime.state, next);
+            for (const clip of runtime.state.clips || []) clip.validated = false;
+        } else {
+            // Historical behavior without Clip 0: REF2VA and FL2VA own separate
+            // timelines and can restore their independent validation/cache state.
+            snapshotModeValidation(runtime);
+            activateModeState(runtime.state, next);
+            if (!restoreModeValidation(runtime)) {
+                for (const clip of runtime.state.clips) clip.validated = false;
+            }
+            runtime.cachedClipIds = new Set();
+            runtime.validatedClipIds = new Set();
+            runtime.computedIndices = new Set();
+            runtime.computedClipIds = new Set();
+            runtime.checkpointActive = false;
+            runtime.checkpointInterrupted = false;
+            runtime.checkpointSnapshotCount = 0;
+            runtime.cachedCount = 0;
+            runtime.validatedCount = 0;
+            runtime.cacheStateRestored = false;
         }
+
         generationModeWidget.value = next;
-        runtime.cachedClipIds = new Set();
-        runtime.validatedClipIds = new Set();
-        runtime.computedIndices = new Set();
-        runtime.computedClipIds = new Set();
-        runtime.checkpointActive = false;
-        runtime.checkpointInterrupted = false;
-        runtime.checkpointSnapshotCount = 0;
-        runtime.cachedCount = 0;
-        runtime.validatedCount = 0;
-        runtime.cacheStateRestored = false;
+        runtime.statusText = sourceActive
+            ? "Clip 0 kept • mode changed • all generated clips invalidated"
+            : runtime.statusText;
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -6024,35 +7000,57 @@ function buildUi(node) {
         if (projectBusy(runtime) || runtime.state?.generation_mode === "fl2va") return;
 
         const nextMotionContext = runtime.state?.motion_context === false;
-        snapshotModeValidation(runtime);
-        const targetKey = validationStateKey("ref2va", nextMotionContext);
-        const hasTargetSnapshot = runtime?.modeValidationState?.[targetKey] instanceof Map;
-        const bootstrap = await bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext);
-        if (bootstrap?.bootstrapped && !hasTargetSnapshot) {
-            seedModeValidationFromCurrent(runtime, "ref2va", nextMotionContext);
+        const sourceActive = Boolean(runtime.continueVideoSocketConnected || activeContinueVideoDescriptor(runtime));
+        let bootstrap = null;
+
+        if (sourceActive) {
+            try {
+                await invalidateContinueVideoModeCaches(
+                    node,
+                    runtime,
+                    "ref2va",
+                    nextMotionContext,
+                );
+            } catch (error) {
+                runtime.statusText = "Clip 0 Motion mode switch failed";
+                render(node, runtime);
+                alert(String(error?.message || error));
+                return;
+            }
+            invalidateAllGeneratedStateForContinueModeSwitch(runtime);
+            runtime.state.motion_context = nextMotionContext;
+            for (const clip of runtime.state.clips || []) clip.validated = false;
+        } else {
+            snapshotModeValidation(runtime);
+            const targetKey = validationStateKey("ref2va", nextMotionContext);
+            const hasTargetSnapshot = runtime?.modeValidationState?.[targetKey] instanceof Map;
+            bootstrap = await bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext);
+            if (bootstrap?.bootstrapped && !hasTargetSnapshot) {
+                seedModeValidationFromCurrent(runtime, "ref2va", nextMotionContext);
+            }
+
+            runtime.state.motion_context = nextMotionContext;
+            // Motion ON and OFF keep separate physical caches, but the first
+            // switch without Clip 0 may inherit the existing rendered timeline.
+            if (!restoreModeValidation(runtime)) {
+                for (const clip of runtime.state.clips) clip.validated = false;
+            }
+            runtime.cachedClipIds = new Set();
+            runtime.validatedClipIds = new Set();
+            runtime.computedIndices = new Set();
+            runtime.computedClipIds = new Set();
+            runtime.checkpointActive = false;
+            runtime.checkpointInterrupted = false;
+            runtime.checkpointSnapshotCount = 0;
+            runtime.cachedCount = 0;
+            runtime.validatedCount = validatedPrefixFromState(runtime.state);
+            runtime.cacheStateRestored = false;
         }
 
-        runtime.state.motion_context = nextMotionContext;
         motionContextWidget.value = runtime.state.motion_context !== false;
-
-        // Motion ON and OFF keep separate physical caches, but the first switch
-        // should inherit already-rendered Ref2VA clips into the target cache.
-        // If the target snapshot still does not exist, fall back to an empty
-        // validation state rather than fabricating validated clips.
-        if (!restoreModeValidation(runtime)) {
-            for (const clip of runtime.state.clips) clip.validated = false;
-        }
-        runtime.cachedClipIds = new Set();
-        runtime.validatedClipIds = new Set();
-        runtime.computedIndices = new Set();
-        runtime.computedClipIds = new Set();
-        runtime.checkpointActive = false;
-        runtime.checkpointInterrupted = false;
-        runtime.checkpointSnapshotCount = 0;
-        runtime.cachedCount = 0;
-        runtime.validatedCount = validatedPrefixFromState(runtime.state);
-        runtime.cacheStateRestored = false;
-        if (bootstrap?.error) {
+        if (sourceActive) {
+            runtime.statusText = "Clip 0 kept • Motion mode changed • all generated clips invalidated";
+        } else if (bootstrap?.error) {
             runtime.statusText = `Motion toggle cache bootstrap failed: ${bootstrap.error}`;
         }
         updateHidden(node, runtime);
@@ -6145,7 +7143,11 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(modeButton, motionButton, add, remove, newProjectButton, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
+    toolbar.append(
+        modeButton, motionButton, add, remove, newProjectButton,
+        saveProjectButton, loadProjectButton, interruptButton, counter, status,
+        projectFileInput,
+    );
 
     const refFileInput = document.createElement("input");
     refFileInput.type = "file";
@@ -6236,6 +7238,11 @@ function buildUi(node) {
         pendingFrameKind: "",
         pendingFrameGuideIndex: -1,
         refBusy: false,
+        continueVideoSocketConnected: Boolean(findInputEntry(node, "continue_existing_video") && inputConnected(findInputEntry(node, "continue_existing_video").input)),
+        continueVideoPreviewMeta: null,
+        continueVideoProbeKey: "",
+        continueVideoProbeEpoch: 0,
+        continueVideoProbeBusy: false,
         projectOperationBusy: false,
         projectName: String(node?.properties?.h3_project_name || ""),
         domWidget: null,
@@ -6718,6 +7725,10 @@ app.registerExtension({
             // LiteGraph mutates link target slots during the callback; defer the
             // socket grow/shrink pass until that mutation has completed.
             deferDynamicAVReferenceSync(this);
+            const runtime = this.__h3Extender;
+            if (runtime) {
+                setTimeout(() => refreshContinueVideoSocketState(this, runtime), 0);
+            }
             return result;
         };
 
@@ -6743,6 +7754,12 @@ app.registerExtension({
                     info.generation_mode || runtime.state?.generation_mode || "ref2va",
                 );
             }
+            // The backend already returns Clip 0 explicitly in h3_extender_state.
+            // Consume that authoritative descriptor directly instead of relying
+            // only on the indirect clips_json round-trip. This also guarantees
+            // the card is restored after Queue if the metadata-only frontend
+            // probe was unavailable or failed.
+            applyExecutedContinueVideoDescriptor(runtime, info);
             if (info.generation_mode) {
                 activateModeState(
                     runtime.state,

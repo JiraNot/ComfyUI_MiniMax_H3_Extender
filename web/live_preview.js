@@ -978,6 +978,13 @@ app.registerExtension({
             if (ownerId == null) return;
             clearPreviewForNewProject(ownerId);
         });
+        window.addEventListener("h3-extender-source-changed", (event) => {
+            const ownerId = event?.detail?.owner_id;
+            if (ownerId == null) return;
+            // Clip 0 is the root of the causal chain, so any previously shown
+            // preview belongs to the old source timeline and must disappear.
+            clearPreviewForNewProject(ownerId);
+        });
         window.addEventListener("h3-extender-project-loaded", (event) => {
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;

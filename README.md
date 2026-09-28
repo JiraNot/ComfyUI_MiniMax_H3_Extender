@@ -17,7 +17,6 @@ MiniMax H3 Extender can now continue from an existing video.
 - The final frames of Clip 0 are used as the visual context for the first generated clip.
 - **Choose Ref** lets you pick any frame from the source video and use it as a normal `<Picture N>` reference, useful for preserving character identity when the end of the source video does not show the subject clearly.
 - Existing Motion Context behavior between generated clips remains unchanged.
-- Optional external `SIGMAS` support introduced in v2.8.5 is retained.
 
 This makes it possible to take an existing video and continue building it directly inside the Extender.
 

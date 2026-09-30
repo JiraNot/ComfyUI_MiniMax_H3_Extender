@@ -103,7 +103,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.9.1"
+BUILD = "minimax-h3-extender-v2.9.2"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -1939,13 +1939,16 @@ def _prepare_standalone_audio_refs(
     clip_start_seconds: float,
     clip_duration_seconds: float,
     cache=None,
+    full_audio_slots=None,
 ):
     """Build per-clip standalone audio refs without reusing illegal long audio.
 
     Reusable refs start at 0 for every clip. A source is treated as a timeline
     only when it is longer than both the 5s split threshold and the current
     H3-aligned clip duration; timeline refs advance by the cumulative duration
-    of preceding cards that selected the same logical Audio slot.
+    of preceding cards that selected the same logical Audio slot. Slots listed
+    in full_audio_slots are clip-local references: they always start at 0 and
+    keep the complete source up to H3's cumulative 15s reference-audio limit.
     """
     active = [
         (slot, audio)
@@ -1966,18 +1969,30 @@ def _prepare_standalone_audio_refs(
     # standalone Audio reference keep its own independent timeline cursor.
     clip_start_offsets = clip_start_seconds if isinstance(clip_start_seconds, dict) else None
     default_clip_start = 0.0 if clip_start_offsets is not None else float(clip_start_seconds)
+    full_audio_slots = {int(slot) for slot in (full_audio_slots or [])}
     prepared = []
     total_effective_audio = 0.0
 
     for slot, audio in active:
         label = f"ref_audio_{slot}"
         source_duration = _audio_duration_seconds(audio)
-        timeline_mode = source_duration > max(
-            REF_AUDIO_TIMELINE_SPLIT_SECONDS,
-            clip_duration_seconds,
-        ) + 1e-6
+        force_full_reference = int(slot) in full_audio_slots
+        timeline_mode = (
+            not force_full_reference
+            and source_duration > max(
+                REF_AUDIO_TIMELINE_SPLIT_SECONDS,
+                clip_duration_seconds,
+            ) + 1e-6
+        )
 
-        if timeline_mode:
+        if force_full_reference:
+            # Clip-local audio is a true H3 reference for this card, not a
+            # multi-clip timeline. Keep the complete source regardless of the
+            # generated clip duration, bounded only by H3's 15s ref-audio limit.
+            start = 0.0
+            duration = min(source_duration, MAX_REF_AUDIO_SECONDS)
+            sliced = _slice_ref_audio(audio, start, duration, label, require_full=False)
+        elif timeline_mode:
             # A true timeline must fit inside H3's per-reference 15s limit for
             # each card. Silently consuming only the first 15s while advancing
             # by a longer card duration would skip source audio between clips.
@@ -6084,6 +6099,7 @@ class MiniMaxH3Extender:
             selected_ref_audios = list(selected_ref_audios)
             selected_audio_slots = list(selected_audio_slots)
             selected_audio_offsets = dict(selected_audio_offsets)
+            local_audio_slots = set()
             for item in local_refs.get("audios", []):
                 slot = int(item["slot"])
                 if ref_audios[slot - 1] is not None:
@@ -6099,6 +6115,7 @@ class MiniMaxH3Extender:
                 if slot not in selected_audio_slots:
                     selected_audio_slots.append(slot)
                 selected_audio_offsets[slot] = 0.0
+                local_audio_slots.add(slot)
             selected_audio_slots = sorted(set(int(x) for x in selected_audio_slots))
             selected_ref_audio_count = len(selected_audio_slots)
 
@@ -6190,6 +6207,7 @@ class MiniMaxH3Extender:
                     selected_audio_offsets,
                     frame_count / float(FPS),
                     cache=standalone_audio_cache,
+                    full_audio_slots=local_audio_slots,
                 )
                 clip_ref_items.extend(audio_items)
                 clip_ref_blocks.extend(audio_blocks)

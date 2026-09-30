@@ -860,6 +860,7 @@ def run(
         selected_ref_audios = list(selected_ref_audios)
         selected_audio_slots = list(selected_audio_slots)
         selected_audio_offsets = dict(selected_audio_offsets)
+        local_audio_slots = set()
         for item in local_refs.get("audios", []):
             slot = int(item["slot"])
             if ref_audios[slot - 1] is not None:
@@ -873,6 +874,7 @@ def run(
             if slot not in selected_audio_slots:
                 selected_audio_slots.append(slot)
             selected_audio_offsets[slot] = 0.0
+            local_audio_slots.add(slot)
         selected_audio_slots = sorted(set(int(x) for x in selected_audio_slots))
         selected_ref_audio_count = len(selected_audio_slots)
 
@@ -956,6 +958,7 @@ def run(
                 selected_audio_offsets,
                 frame_count / float(e.FPS),
                 cache=standalone_audio_cache,
+                full_audio_slots=local_audio_slots,
             )
             clip_ref_items.extend(audio_items)
             clip_ref_blocks.extend(audio_blocks)

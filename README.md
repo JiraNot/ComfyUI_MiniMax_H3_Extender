@@ -6,6 +6,14 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### Project status
+
+This is probably the **final feature release** of MiniMax H3 Extender.
+
+Apart from possible bug fixes or compatibility corrections, I do not currently plan to continue active development of this project.
+
+---
+
 ### 🚀 New: v3.0.5 — Latent Refine / Upscale
 
 A new optional **Latent Refine / Upscale** mode is now available, inspired by the latent refine work introduced in **PR #83**.

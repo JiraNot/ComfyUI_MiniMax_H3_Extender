@@ -70,7 +70,8 @@ function uiMinHeightForState(state) {
     // nine internal references, FL2VA shows each plan's First/Last frames.
     // Keeping one fixed strip height also prevents mode switches from pulling
     // the DOM widget upward into the native widgets in Nodes 2.0.
-    return Math.max(UI_MIN_HEIGHT, 55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+    const refineExtra = state?.refine_enabled ? 66 : 0;
+    return Math.max(UI_MIN_HEIGHT, 55 + refineExtra + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
 }
 
 function nodes2MinHeightForState(state) {
@@ -94,6 +95,10 @@ const PROJECT_WIDGETS = [
     "refs_json",
     "generation_mode",
     "motion_context",
+    "refine_enabled",
+    "refine_scale",
+    "refine_steps",
+    "refine_denoise",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -114,6 +119,19 @@ function boolValue(value, defaultValue = true) {
     if (["false", "0", "off", "no"].includes(text)) return false;
     if (["true", "1", "on", "yes"].includes(text)) return true;
     return Boolean(value);
+}
+
+function refineSettingsOpenFromNode(node) {
+    return boolValue(node?.properties?.h3_refine_settings_open, false);
+}
+
+function persistRefineSettingsOpen(node, runtime, open) {
+    const next = Boolean(open);
+    if (runtime) runtime.refineSettingsOpen = next;
+    if (!node.properties || typeof node.properties !== "object") node.properties = {};
+    node.properties.h3_refine_settings_open = next;
+    notifyWorkflowChanged(node, runtime);
+    captureNativeWorkflowState(node, runtime);
 }
 
 function ref2vaIndependentMode(state) {
@@ -1610,6 +1628,22 @@ function pythonRound(value) {
     return Math.round(x);
 }
 
+function refinedResolutionFromBase(width, height, scale) {
+    const base = effectiveManualResolution(width, height);
+    const s = Math.max(1.0, Number(scale || 1.0));
+    return {
+        width: Math.max(32, pythonRound((base.width * s) / 32.0) * 32),
+        height: Math.max(32, pythonRound((base.height * s) / 32.0) * 32),
+    };
+}
+
+function currentRefineTargetResolution(node, runtime) {
+    const width = Number(getWidget(node, "width")?.value || runtime?.resolvedWidth || runtime?.expectedResolution?.width || 0);
+    const height = Number(getWidget(node, "height")?.value || runtime?.resolvedHeight || runtime?.expectedResolution?.height || 0);
+    if (!(width > 0) || !(height > 0)) return null;
+    return refinedResolutionFromBase(width, height, Number(runtime?.refineScaleWidget?.value ?? 1.5));
+}
+
 function autoResolutionFromDimensions(srcWidth, srcHeight, megapixels) {
     const srcW = Number(srcWidth || 0);
     const srcH = Number(srcHeight || 0);
@@ -1909,7 +1943,15 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         .lg-node-widget:has(> [node-type="${TARGET}"] > textarea),
         .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="generation_mode"]),
         .lg-node-widget:has([aria-label="motion_context"]),
-        .lg-node-widget:has([name="motion_context"]) {
+        .lg-node-widget:has([name="motion_context"]),
+        .lg-node-widget:has([aria-label="refine_enabled"]),
+        .lg-node-widget:has([name="refine_enabled"]),
+        .lg-node-widget:has([aria-label="refine_scale"]),
+        .lg-node-widget:has([name="refine_scale"]),
+        .lg-node-widget:has([aria-label="refine_steps"]),
+        .lg-node-widget:has([name="refine_steps"]),
+        .lg-node-widget:has([aria-label="refine_denoise"]),
+        .lg-node-widget:has([name="refine_denoise"]) {
             display: none !important;
         }
 
@@ -5706,6 +5748,38 @@ function render(node, runtime) {
             ? "Independent Ref2VA clips: no Motion Context; reruns and edits stay targeted"
             : "Causal Ref2VA chain: each clip receives Motion Context from the previous clip";
     }
+    const refineOn = boolValue(runtime.refineEnabledWidget?.value, false);
+    state.refine_enabled = refineOn;
+    if (runtime.refineButton) {
+        runtime.refineButton.textContent = refineOn ? "REFINE: ON" : "REFINE: OFF";
+        runtime.refineButton.title = refineOn
+            ? "Direct latent upscale + refine is active; changing it invalidates generated clips"
+            : "Enable direct latent upscale + H3 refine";
+        runtime.refineButton.style.fontWeight = "700";
+        runtime.refineButton.style.border = refineOn
+            ? "1px solid rgba(191,166,255,.78)"
+            : "1px solid rgba(255,255,255,.18)";
+        runtime.refineButton.style.background = refineOn
+            ? "rgba(112,78,190,.34)"
+            : "rgba(255,255,255,.055)";
+        runtime.refineButton.style.boxShadow = refineOn
+            ? "0 0 0 1px rgba(145,110,230,.18) inset"
+            : "none";
+    }
+    if (runtime.refinePanel) {
+        runtime.refinePanel.style.display = refineOn ? "block" : "none";
+        const shouldOpen = Boolean(runtime.refineSettingsOpen);
+        if (runtime.refinePanel.open !== shouldOpen) runtime.refinePanel.open = shouldOpen;
+    }
+    if (runtime.refineScaleInput) runtime.refineScaleInput.value = String(runtime.refineScaleWidget?.value ?? 1.5);
+    if (runtime.refineStepsInput) runtime.refineStepsInput.value = String(runtime.refineStepsWidget?.value ?? 4);
+    if (runtime.refineDenoiseInput) runtime.refineDenoiseInput.value = String(runtime.refineDenoiseWidget?.value ?? 0.30);
+    if (runtime.refineTargetLabel) {
+        const target = currentRefineTargetResolution(node, runtime);
+        runtime.refineTargetLabel.textContent = target
+            ? `Final video: ${target.width} × ${target.height}`
+            : "Final video: —";
+    }
     const sourceVideo = activeContinueVideoDescriptor(runtime);
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = state.motion_context !== false;
@@ -6854,7 +6928,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - (runtime.state?.refine_enabled ? 66 : 0) - REF_SECTION_HEIGHT)}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -6890,6 +6964,10 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = motionContext;
 
     runtime.refsState = parseRefsState(runtime.refsWidget?.value);
+    // node.properties is restored by ComfyUI during node.configure(). buildUi()
+    // can run before that restore, so always re-read the persisted Refine panel
+    // state during hydration instead of keeping the construction-time default.
+    runtime.refineSettingsOpen = refineSettingsOpenFromNode(node);
     snapshotModeValidation(runtime, mode, motionContext);
     const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
     runtime.cachedCount = restoredValidatedPrefix;
@@ -6955,6 +7033,10 @@ function buildUi(node) {
     const refsWidget = getWidget(node, "refs_json");
     const generationModeWidget = getWidget(node, "generation_mode");
     const motionContextWidget = getWidget(node, "motion_context");
+    const refineEnabledWidget = getWidget(node, "refine_enabled") || { name: "refine_enabled", value: false };
+    const refineScaleWidget = getWidget(node, "refine_scale") || { name: "refine_scale", value: 1.5 };
+    const refineStepsWidget = getWidget(node, "refine_steps") || { name: "refine_steps", value: 4 };
+    const refineDenoiseWidget = getWidget(node, "refine_denoise") || { name: "refine_denoise", value: 0.30 };
     const contextLengthWidget = getWidget(node, "context_length");
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
     if (!jsonWidget || !refsWidget || !generationModeWidget || !motionContextWidget) return null;
@@ -6962,8 +7044,13 @@ function buildUi(node) {
     hideNativeWidget(node, refsWidget);
     hideNativeWidget(node, generationModeWidget);
     hideNativeWidget(node, motionContextWidget);
+    if (getWidget(node, "refine_enabled")) hideNativeWidget(node, refineEnabledWidget);
+    if (getWidget(node, "refine_scale")) hideNativeWidget(node, refineScaleWidget);
+    if (getWidget(node, "refine_steps")) hideNativeWidget(node, refineStepsWidget);
+    if (getWidget(node, "refine_denoise")) hideNativeWidget(node, refineDenoiseWidget);
 
     const state = parseState(jsonWidget.value);
+    state.refine_enabled = boolValue(refineEnabledWidget.value, false);
     // Initial node construction can happen before a saved workflow has been
     // configured. This state is display-only until loadedGraphNode hydrates it
     // from the native serialized widgets.
@@ -7125,6 +7212,118 @@ function buildUi(node) {
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
     });
 
+    const invalidateRefineUi = (message) => {
+        for (const clip of runtime?.state?.clips || []) clip.validated = false;
+        for (const list of Object.values(runtime?.state?.mode_clips || {})) {
+            if (Array.isArray(list)) for (const clip of list) clip.validated = false;
+        }
+        if (runtime) {
+            runtime.modeValidationState = {};
+            runtime.cachedClipIds = new Set();
+            runtime.validatedClipIds = new Set();
+            runtime.computedIndices = new Set();
+            runtime.computedClipIds = new Set();
+            runtime.cachedCount = 0;
+            runtime.validatedCount = 0;
+            runtime.cacheStateRestored = false;
+            runtime.statusText = message || "Refine settings changed • generated clips invalidated";
+            updateHidden(node, runtime);
+            render(node, runtime);
+            requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+        }
+    };
+
+    const refineButton = document.createElement("button");
+    refineButton.title = "Toggle direct latent upscale + H3 refine generation";
+    refineButton.style.fontWeight = "700";
+    refineButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (projectBusy(runtime)) return;
+        const next = !boolValue(refineEnabledWidget.value, false);
+        if (next && (runtime.continueVideoSocketConnected || activeContinueVideoDescriptor(runtime))) {
+            alert("Latent Refine 3.0 is not yet available with Clip 0 / continue_existing_video.");
+            return;
+        }
+        refineEnabledWidget.value = next;
+        runtime.state.refine_enabled = next;
+        invalidateRefineUi(next ? "Latent Refine ON • generated clips invalidated" : "Latent Refine OFF • generated clips invalidated");
+    });
+
+    const initialRefineSettingsOpen = refineSettingsOpenFromNode(node);
+    const refinePanel = document.createElement("details");
+    refinePanel.open = initialRefineSettingsOpen;
+    refinePanel.style.margin = "0 0 7px";
+    refinePanel.style.padding = "7px 9px";
+    refinePanel.style.border = "1px solid rgba(191,166,255,.58)";
+    refinePanel.style.borderRadius = "8px";
+    refinePanel.style.background = "rgba(78,57,128,.22)";
+    refinePanel.style.boxShadow = "0 0 0 1px rgba(120,88,185,.10) inset";
+    const refineSummary = document.createElement("summary");
+    refineSummary.textContent = "⚙  REFINE SETTINGS";
+    refineSummary.title = "Scale factor, refine steps and refine denoise";
+    refineSummary.style.cursor = "pointer";
+    refineSummary.style.fontSize = "12px";
+    refineSummary.style.fontWeight = "750";
+    refineSummary.style.letterSpacing = ".035em";
+    refineSummary.style.padding = "2px 1px";
+    refineSummary.style.userSelect = "none";
+    const refineControls = document.createElement("div");
+    refineControls.style.display = "flex";
+    refineControls.style.flexWrap = "wrap";
+    refineControls.style.alignItems = "center";
+    refineControls.style.gap = "10px 14px";
+    refineControls.style.padding = "9px 1px 2px";
+    const makeRefineNumber = (labelText, widget, min, max, step) => {
+        const label = document.createElement("label");
+        label.style.fontSize = "11px";
+        label.style.fontWeight = "600";
+        label.style.display = "flex";
+        label.style.alignItems = "center";
+        label.style.gap = "6px";
+        label.textContent = labelText;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = String(widget.value);
+        input.style.width = "72px";
+        input.style.height = "24px";
+        input.style.boxSizing = "border-box";
+        input.style.padding = "2px 5px";
+        input.style.border = "1px solid rgba(255,255,255,.20)";
+        input.style.borderRadius = "5px";
+        input.style.background = "rgba(10,10,10,.50)";
+        input.addEventListener("change", () => {
+            let value = Number(input.value);
+            if (!Number.isFinite(value)) value = Number(widget.value);
+            value = Math.max(Number(min), Math.min(Number(max), value));
+            if (widget === refineStepsWidget) value = Math.round(value);
+            widget.value = value;
+            input.value = String(value);
+            if (boolValue(refineEnabledWidget.value, false)) invalidateRefineUi();
+        });
+        label.append(input);
+        refineControls.append(label);
+        return input;
+    };
+    const refineScaleInput = makeRefineNumber("Scale", refineScaleWidget, 1.0, 2.0, 0.05);
+    const refineStepsInput = makeRefineNumber("Steps", refineStepsWidget, 1, 100, 1);
+    const refineDenoiseInput = makeRefineNumber("Denoise", refineDenoiseWidget, 0.01, 1.0, 0.01);
+    const refineTargetLabel = document.createElement("span");
+    refineTargetLabel.style.fontSize = "11px";
+    refineTargetLabel.style.fontWeight = "650";
+    refineTargetLabel.style.opacity = ".88";
+    refineTargetLabel.style.whiteSpace = "nowrap";
+    refineTargetLabel.textContent = "Final video: —";
+    refineControls.append(refineTargetLabel);
+    refinePanel.append(refineSummary, refineControls);
+    refinePanel.addEventListener("toggle", () => {
+        if (!runtime || runtime.hydrating || isH3GraphConfiguring()) return;
+        persistRefineSettingsOpen(node, runtime, refinePanel.open);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
     const add = document.createElement("button");
     add.textContent = "+ Add Clip";
     add.addEventListener("click", (e) => {
@@ -7209,7 +7408,7 @@ function buildUi(node) {
     status.style.maxWidth = "55%";
 
     toolbar.append(
-        modeButton, motionButton, add, remove, newProjectButton,
+        modeButton, motionButton, refineButton, add, remove, newProjectButton,
         saveProjectButton, loadProjectButton, interruptButton, counter, status,
         projectFileInput,
     );
@@ -7266,10 +7465,10 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT)}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - (state?.refine_enabled ? 66 : 0) - REF_SECTION_HEIGHT)}px`;
     cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
 
-    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput);
+    root.append(toolbar, refinePanel, refsSection, cards, refFileInput, frameFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -7294,10 +7493,21 @@ function buildUi(node) {
         frameFileInput,
         generationModeWidget,
         motionContextWidget,
+        refineEnabledWidget,
+        refineScaleWidget,
+        refineStepsWidget,
+        refineDenoiseWidget,
         contextLengthWidget,
         audioContextLengthWidget,
         modeButton,
         motionButton,
+        refineButton,
+        refinePanel,
+        refineSettingsOpen: initialRefineSettingsOpen,
+        refineScaleInput,
+        refineStepsInput,
+        refineDenoiseInput,
+        refineTargetLabel,
         pendingRefSlot: -1,
         pendingFrameClip: -1,
         pendingFrameKind: "",

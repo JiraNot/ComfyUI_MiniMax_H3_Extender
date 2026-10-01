@@ -6,6 +6,24 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### 🚀 New: v3.0.5 — Latent Refine / Upscale
+
+A new optional **Latent Refine / Upscale** mode is now available, inspired by the latent refine work introduced in **PR #83**.
+
+When enabled, each clip is generated normally, then its latent is upscaled and passed through a second H3 refine pass before continuing through the Extender’s existing cache, Motion Context, preview and export pipeline.
+
+There is no separate draft/refine workflow: the refined result becomes the clip’s final result directly.
+
+Refine settings include:
+- **Scale Factor**
+- **Refine Steps**
+- **Refine Denoise**
+- automatic display of the resulting final video resolution
+
+The same H3 model is reused for both passes, and the required latent upscaler model is downloaded automatically on first use.
+
+---
+
 ## 🆕 v2.9.0 — Continue an Existing Video
 
 MiniMax H3 Extender can now continue from an existing video.

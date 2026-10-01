@@ -17,7 +17,7 @@ from pathlib import Path
 
 SEQUENCE_MODE = "ref2va_independent"
 INTERRUPT_MODE = "ref2va"
-BUILD = "ref2va-independent-v2.7.0"
+BUILD = "ref2va-independent-v3.0.0"
 
 
 def cache_owner_id(owner_id) -> str:
@@ -614,6 +614,10 @@ def run(
     continue_existing_video=None,
     continue_video_resize=None,
     sigmas=None,
+    refine_enabled=False,
+    refine_scale=1.5,
+    refine_steps=8,
+    refine_denoise=0.30,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
     from . import extender as e
@@ -669,22 +673,25 @@ def run(
 
     cache_resolution = e._resolution_from_manifest(manifest)
     previous_cache_resolution = None
-    if manifest.get("segments") and cache_resolution is not None:
-        if (
-            int(cache_resolution["width"]) != resolved_width
-            or int(cache_resolution["height"]) != resolved_height
-        ):
-            previous_cache_resolution = dict(cache_resolution)
-            # Geometry is the only global invalidation: a random-access cache still
-            # cannot mix incompatible latent tensor sizes.
-            for cid in list(cached_ids(manifest)):
-                from . import fl2va_engine as f
-                f._invalidate_plan_video_cache(data_path, cid)
-            manifest = d._truncate_chain(data_path, manifest_path, manifest, 0)
-            manifest = dict(manifest)
-            manifest["sequence_mode"] = SEQUENCE_MODE
-            manifest["updated_at"] = time.time()
-            d._write_json_atomic(manifest_path, manifest)
+    expected_cache_width, expected_cache_height = (
+        e.target_dimensions(resolved_width, resolved_height, refine_scale)
+        if refine_enabled else (resolved_width, resolved_height)
+    )
+    refine_payload = e._refine_settings_payload(
+        refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas
+    )
+    if manifest.get("segments"):
+        geometry_changed = bool(
+            cache_resolution is None
+            or int(cache_resolution["width"]) != int(expected_cache_width)
+            or int(cache_resolution["height"]) != int(expected_cache_height)
+        )
+        settings_changed = e._refine_settings_changed(manifest, refine_payload)
+        if geometry_changed or settings_changed:
+            previous_cache_resolution = dict(cache_resolution) if cache_resolution else None
+            data_path, manifest_path, manifest = drop_cached_ids(
+                owner, e.FPS, clip_ids, clip_ids
+            )
             for cfg in clips:
                 cfg["validated"] = False
             resolution["cache_reset"] = True
@@ -709,6 +716,8 @@ def run(
     manifest = dict(manifest)
     manifest["extender_refs_signature"] = refs_signature
     manifest["extender_ref_ids"] = [ref.get("id") if isinstance(ref, dict) else None for ref in refs]
+    manifest["refine_mode"] = dict(refine_payload)
+    manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
     manifest["updated_at"] = time.time()
     d._write_json_atomic(manifest_path, manifest)
 
@@ -1031,6 +1040,20 @@ def run(
             float(denoise),
             sigmas=sample_sigmas,
         )
+        if refine_enabled:
+            first_pass = sampled
+            sampled, _refine_trim, _refine_w, _refine_h = e._refine_ref2va_sample(
+                owner=owner, clip_index=i, clip_count=len(clips), sampled=first_pass,
+                clip_model=clip_model, clip_text_encoder=clip_text_encoder, vae=vae,
+                prompt=cfg["prompt"], frame_count=frame_count,
+                clip_ref_items=clip_ref_items, clip_ref_blocks=clip_ref_blocks,
+                clip_picture_slots=clip_picture_slots, clip_video_slots=clip_video_slots,
+                selected_audio_slots=selected_audio_slots, audio_native_offset=audio_native_offset,
+                seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
+                refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                external_sigmas=sigmas, motion=None, previous_refined_proxy=None,
+            )
+            del first_pass
 
         _handle, _proxy, manifest, cache_status, _cache_mb = store_segment(
             owner,

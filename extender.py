@@ -49,7 +49,9 @@ from aiohttp import web
 from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
-from .motion_context_ram import MiniMaxH3MotionContextRAM
+from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
+from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
+from .latent_upscaler import target_dimensions
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
 from .motion_context_disk import (
@@ -103,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.9.2"
+BUILD = "minimax-h3-extender-v3.0.5"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -1732,6 +1734,12 @@ def _resolve_generation_resolution(resolution_mode, megapixels, width, height, r
     }
 
 def _resolution_from_manifest(manifest):
+    """Physical latent-cache resolution stored by Disk Join.
+
+    With Refine enabled this is the *refined/upscaled* geometry. Keep this
+    helper for cache-compatibility checks only; UI/project resolution must use
+    ``_base_resolution_from_manifest`` instead.
+    """
     if not isinstance(manifest, dict):
         return None
     geom = manifest.get("geometry")
@@ -1745,6 +1753,29 @@ def _resolution_from_manifest(manifest):
     if w <= 0 or h <= 0:
         return None
     return {"width": w, "height": h}
+
+
+def _base_resolution_from_manifest(manifest):
+    """Generation/input resolution represented by the workflow controls.
+
+    v3 Refine caches intentionally store an upscaled physical latent geometry,
+    while the first H3 pass and the visible resolution widgets stay at the base
+    project resolution.  Never feed the refined cache geometry back into those
+    controls after refresh/save/load.
+    """
+    if isinstance(manifest, dict):
+        base = manifest.get("base_resolution")
+        if isinstance(base, dict):
+            try:
+                w = int(base.get("width", 0))
+                h = int(base.get("height", 0))
+            except Exception:
+                w = h = 0
+            if w > 0 and h > 0:
+                return {"width": w, "height": h}
+    # Backward compatibility for all pre-v3 caches and any legacy manifest
+    # that predates explicit base_resolution metadata.
+    return _resolution_from_manifest(manifest)
 
 
 def _resize(image, width: int, height: int):
@@ -2572,6 +2603,117 @@ def _sample_h3(
     out.pop("downscale_ratio_temporal", None)
     out["samples"] = samples
     return out
+
+
+
+def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=None):
+    enabled = bool(enabled)
+    if not enabled:
+        return {"enabled": False}
+    sig_count = int(external_sigmas.numel()) if torch.is_tensor(external_sigmas) else 0
+    sig_signature = ""
+    if torch.is_tensor(external_sigmas):
+        vals = external_sigmas.detach().float().reshape(-1).cpu().tolist()
+        sig_signature = hashlib.sha1(",".join(f"{float(v):.8g}" for v in vals).encode("utf-8")).hexdigest()[:20]
+    return {
+        "enabled": True,
+        "scale": round(float(scale), 6),
+        "steps": int(steps),
+        "denoise": round(float(denoise), 6),
+        "external_sigmas": bool(external_sigmas is not None),
+        "sigma_count": sig_count,
+        "sigma_signature": sig_signature,
+    }
+
+
+def _refine_settings_changed(manifest, payload):
+    previous = manifest.get("refine_mode") if isinstance(manifest, dict) else None
+    if previous is None:
+        previous = {"enabled": False}
+    return dict(previous) != dict(payload)
+
+
+def _resize_context_latent_spatial(latent, width: int, height: int):
+    """Transiently resize a cached refined AV latent for base-resolution Motion Context."""
+    video, audio = _streams_from_latent(latent, "samples")
+    target_h = int(height) // 16
+    target_w = int(width) // 16
+    if tuple(video.shape[-2:]) == (target_h, target_w):
+        return latent
+    resized = torch.nn.functional.interpolate(
+        video.float(),
+        size=(int(video.shape[2]), target_h, target_w),
+        mode="trilinear",
+        align_corners=False,
+    ).to(dtype=video.dtype, device=video.device)
+    out = latent.copy()
+    out["samples"] = comfy.nested_tensor.NestedTensor((resized, audio))
+    return out
+
+
+def _refine_progress(owner, clip_index, clip_count, text):
+    _send_extender_progress(owner, clip_index, clip_count, "refining", text)
+
+
+def _refine_ref2va_sample(
+    *, owner, clip_index, clip_count, sampled, clip_model, clip_text_encoder, vae,
+    prompt, frame_count, clip_ref_items, clip_ref_blocks, clip_picture_slots,
+    clip_video_slots, selected_audio_slots, audio_native_offset, seed,
+    sampler_name, scheduler, refine_scale, refine_steps, refine_denoise,
+    external_sigmas, motion=None, previous_refined_proxy=None,
+    context_length="22", audio_context_length=0,
+):
+    """Direct upscale+refine; returns the sole final sample and refine trim."""
+    _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
+    up_latent, out_w, out_h, first_audio = upscale_for_refine(
+        sampled,
+        float(refine_scale),
+        progress=lambda msg: _refine_progress(owner, clip_index, clip_count, msg),
+    )
+    refine_positive, _unused = _make_ref2va_conditioning(
+        clip_text_encoder, vae, prompt, out_w, out_h, frame_count,
+        clip_ref_items, clip_ref_blocks, clip_picture_slots, clip_video_slots,
+        active_audio_slots=selected_audio_slots,
+        audio_native_offset=audio_native_offset,
+    )
+    refine_trim = None
+    if motion is not None and previous_refined_proxy is not None:
+        refine_positive, refine_trim, _, _, _ = motion.apply(
+            refine_positive, up_latent, previous_refined_proxy,
+            str(context_length), int(audio_context_length),
+        )
+    _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
+    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    refined = _sample_h3(
+        clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
+        int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
+    )
+    refined = preserve_first_pass_audio(refined, first_audio)
+    return refined, refine_trim, out_w, out_h
+
+
+def _refine_fl2va_sample(
+    *, owner, clip_index, clip_count, sampled, clip_model, clip_text_encoder, vae,
+    prompt, frame_count, first_frame, last_frame, guide_frames, seed,
+    sampler_name, scheduler, refine_scale, refine_steps, refine_denoise, external_sigmas,
+):
+    _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
+    up_latent, out_w, out_h, first_audio = upscale_for_refine(
+        sampled,
+        float(refine_scale),
+        progress=lambda msg: _refine_progress(owner, clip_index, clip_count, msg),
+    )
+    refine_positive, _ = make_fl2va_conditioning(
+        clip_text_encoder, vae, prompt, out_w, out_h, frame_count,
+        first_frame=first_frame, last_frame=last_frame, guide_frames=guide_frames,
+    )
+    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
+    refined = _sample_h3(
+        clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
+        int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
+    )
+    return preserve_first_pass_audio(refined, first_audio), out_w, out_h
 
 
 def _normalize_color_adjustment(value=None):
@@ -3765,7 +3907,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 final_video_files = sorted([p for p in final_dir.iterdir() if p.is_file()])
 
     if snapshot is not None:
-        cache_resolution = _resolution_from_manifest(snapshot.get("manifest"))
+        cache_resolution = _base_resolution_from_manifest(snapshot.get("manifest"))
         if cache_resolution is not None:
             extender_payload = project_payload.setdefault("extender", {})
             resolution = extender_payload.setdefault("resolution", {})
@@ -4364,7 +4506,7 @@ def _import_project_archive(owner_id, archive_path):
                 imported_manifest["updated_at"] = time.time()
                 _write_json_atomic(new_manifest, imported_manifest)
 
-                imported_resolution = _resolution_from_manifest(imported_manifest)
+                imported_resolution = _base_resolution_from_manifest(imported_manifest)
                 if imported_resolution is not None:
                     extender_payload = project_payload.setdefault("extender", {})
                     resolution = extender_payload.setdefault("resolution", {})
@@ -4555,7 +4697,7 @@ def _import_project_archive(owner_id, archive_path):
                             break
                         validated_count += 1
 
-            loaded_resolution = _resolution_from_manifest(imported_manifest)
+            loaded_resolution = _base_resolution_from_manifest(imported_manifest)
             return {
                 "project_name": str(archive_meta.get("project_name") or archive_path.stem),
                 "project": project_payload,
@@ -4793,6 +4935,22 @@ class MiniMaxH3Extender:
                 "BOOLEAN",
                 {"default": True, "tooltip": "Ref2VA only: chain clips with Motion Context. Disable for independent random-access clips."},
             ),
+            "refine_enabled": (
+                "BOOLEAN",
+                {"default": False, "tooltip": "Direct latent upscale/refine mode. Changing this setting invalidates generated clips."},
+            ),
+            "refine_scale": (
+                "FLOAT",
+                {"default": 1.5, "min": 1.0, "max": 2.0, "step": 0.05},
+            ),
+            "refine_steps": (
+                "INT",
+                {"default": 4, "min": 1, "max": 100, "step": 1},
+            ),
+            "refine_denoise": (
+                "FLOAT",
+                {"default": 0.30, "min": 0.01, "max": 1.0, "step": 0.01},
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -5003,6 +5161,10 @@ class MiniMaxH3Extender:
         continue_existing_video=None,
         continue_video_resize=None,
         sigmas=None,
+        refine_enabled=False,
+        refine_scale=1.5,
+        refine_steps=4,
+        refine_denoise=0.30,
     ):
         if fl2va_model is None:
             raise ValueError(
@@ -5058,17 +5220,25 @@ class MiniMaxH3Extender:
 
         cache_resolution = _resolution_from_manifest(manifest)
         previous_cache_resolution = None
-        if manifest.get("segments") and cache_resolution is not None:
-            if (
-                int(cache_resolution["width"]) != resolved_width
-                or int(cache_resolution["height"]) != resolved_height
-            ):
-                previous_cache_resolution = dict(cache_resolution)
-                manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
-                manifest = dict(manifest)
-                manifest["sequence_mode"] = "fl2va"
-                manifest["updated_at"] = time.time()
-                _write_json_atomic(manifest_path, manifest)
+        expected_cache_width, expected_cache_height = (
+            target_dimensions(resolved_width, resolved_height, refine_scale)
+            if refine_enabled else (resolved_width, resolved_height)
+        )
+        refine_payload = _refine_settings_payload(
+            refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas
+        )
+        if manifest.get("segments"):
+            geometry_changed = bool(
+                cache_resolution is None
+                or int(cache_resolution["width"]) != int(expected_cache_width)
+                or int(cache_resolution["height"]) != int(expected_cache_height)
+            )
+            settings_changed = _refine_settings_changed(manifest, refine_payload)
+            if geometry_changed or settings_changed:
+                previous_cache_resolution = dict(cache_resolution) if cache_resolution else None
+                data_path, manifest_path, manifest = drop_fl2va_cached_ids(
+                    owner, FPS, clip_ids, clip_ids
+                )
                 for cfg in clips:
                     cfg["validated"] = False
                 resolution["cache_reset"] = True
@@ -5093,6 +5263,11 @@ class MiniMaxH3Extender:
         # card ids, which is what makes insert/remove/reorder independent of the
         # physical append-only latent file.
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+        manifest = dict(manifest)
+        manifest["refine_mode"] = dict(refine_payload)
+        manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
         manifest, active_export_profile = _pin_full_batch_export_profile(
             manifest_path, manifest, run_mode, export_profile
         )
@@ -5360,6 +5535,18 @@ class MiniMaxH3Extender:
                 str(sampler_name), str(scheduler), int(steps), float(denoise),
                 sigmas=sample_sigmas,
             )
+            if refine_enabled:
+                first_pass = sampled
+                sampled, _refine_w, _refine_h = _refine_fl2va_sample(
+                    owner=owner, clip_index=i, clip_count=len(clips), sampled=first_pass,
+                    clip_model=clip_model, clip_text_encoder=clip_text_encoder, vae=vae,
+                    prompt=cfg.get("prompt", ""), frame_count=frame_count,
+                    first_frame=first_frame, last_frame=last_frame, guide_frames=guide_frames,
+                    seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
+                    refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                    external_sigmas=sigmas,
+                )
+                del first_pass
             (
                 previous_handle,
                 _proxy,
@@ -5609,6 +5796,10 @@ class MiniMaxH3Extender:
         refs_json=None,
         generation_mode="ref2va",
         motion_context=True,
+        refine_enabled=False,
+        refine_scale=1.5,
+        refine_steps=4,
+        refine_denoise=0.30,
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -5617,6 +5808,10 @@ class MiniMaxH3Extender:
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
         motion_context = bool(motion_context)
+        refine_enabled = bool(refine_enabled)
+        refine_scale = max(1.0, min(2.0, float(refine_scale)))
+        refine_steps = max(1, int(refine_steps))
+        refine_denoise = max(0.01, min(1.0, float(refine_denoise)))
         external_sigmas = kwargs.get("sigmas")
         sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
         continue_video_input = kwargs.get("continue_existing_video")
@@ -5626,6 +5821,11 @@ class MiniMaxH3Extender:
             else _continue_video_from_state(clips_json)
         )
         continue_video_resize = _continue_resize_from_state(clips_json)
+        if refine_enabled and continue_existing_video is not None:
+            raise ValueError(
+                "MiniMax H3 Extender 3.0: Latent Refine is not yet available with Clip 0 / continue_existing_video, "
+                "because Clip 0 must share the refined output resolution for final concatenation."
+            )
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -5669,6 +5869,8 @@ class MiniMaxH3Extender:
                 continue_existing_video=continue_existing_video,
                 continue_video_resize=continue_video_resize,
                 sigmas=external_sigmas,
+                refine_enabled=refine_enabled, refine_scale=refine_scale,
+                refine_steps=refine_steps, refine_denoise=refine_denoise,
             )
 
         if not motion_context:
@@ -5689,6 +5891,8 @@ class MiniMaxH3Extender:
                 continue_existing_video=continue_existing_video,
                 continue_video_resize=continue_video_resize,
                 sigmas=external_sigmas,
+                refine_enabled=refine_enabled, refine_scale=refine_scale,
+                refine_steps=refine_steps, refine_denoise=refine_denoise,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -5836,12 +6040,23 @@ class MiniMaxH3Extender:
 
         resolved_width = int(resolution["width"])
         resolved_height = int(resolution["height"])
+        expected_cache_width, expected_cache_height = (
+            target_dimensions(resolved_width, resolved_height, refine_scale)
+            if refine_enabled else (resolved_width, resolved_height)
+        )
+        refine_payload = _refine_settings_payload(
+            refine_enabled, refine_scale, refine_steps, refine_denoise, external_sigmas
+        )
+        refine_mode_changed = bool(
+            cache_has_segments and _refine_settings_changed(manifest, refine_payload)
+        )
 
         requested_mismatch = bool(
             cache_has_segments
             and (
-                int(cache_resolution["width"]) != resolved_width
-                or int(cache_resolution["height"]) != resolved_height
+                int(cache_resolution["width"]) != int(expected_cache_width)
+                or int(cache_resolution["height"]) != int(expected_cache_height)
+                or refine_mode_changed
             )
         )
         previous_cache_resolution = dict(cache_resolution) if requested_mismatch else None
@@ -5886,6 +6101,8 @@ class MiniMaxH3Extender:
         manifest["extender_ref_ids"] = [
             ref.get("id") if isinstance(ref, dict) else None for ref in refs
         ]
+        manifest["refine_mode"] = dict(refine_payload)
+        manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
         manifest["updated_at"] = time.time()
         _write_json_atomic(manifest_path, manifest)
 
@@ -6238,13 +6455,19 @@ class MiniMaxH3Extender:
                     raise RuntimeError(
                         "MiniMax H3 Extender: previous cached latent is unavailable."
                     )
+                base_context_proxy = (
+                    _resize_context_latent_spatial(previous_proxy, resolved_width, resolved_height)
+                    if refine_enabled else previous_proxy
+                )
                 positive, trim_frames, _, _, _ = motion.apply(
                     positive,
                     latent,
-                    previous_proxy,
+                    base_context_proxy,
                     str(context_length),
                     int(audio_context_length),
                 )
+                if base_context_proxy is not previous_proxy:
+                    del base_context_proxy
             elif source_meta is not None:
                 _send_extender_progress(
                     owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
@@ -6297,6 +6520,24 @@ class MiniMaxH3Extender:
                 float(denoise),
                 sigmas=sample_sigmas,
             )
+            if refine_enabled:
+                first_pass = sampled
+                sampled, refine_trim, _refine_w, _refine_h = _refine_ref2va_sample(
+                    owner=owner, clip_index=i, clip_count=len(clips), sampled=first_pass,
+                    clip_model=clip_model, clip_text_encoder=clip_text_encoder, vae=vae,
+                    prompt=cfg["prompt"], frame_count=frame_count,
+                    clip_ref_items=clip_ref_items, clip_ref_blocks=clip_ref_blocks,
+                    clip_picture_slots=clip_picture_slots, clip_video_slots=clip_video_slots,
+                    selected_audio_slots=selected_audio_slots, audio_native_offset=audio_native_offset,
+                    seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
+                    refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                    external_sigmas=external_sigmas, motion=motion,
+                    previous_refined_proxy=(previous_proxy if i > 0 else None),
+                    context_length=context_length, audio_context_length=audio_context_length,
+                )
+                del first_pass
+                if refine_trim is not None:
+                    trim_frames = refine_trim
 
             result = disk_join.join(
                 samples=sampled,

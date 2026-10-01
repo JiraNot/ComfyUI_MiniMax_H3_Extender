@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.9.2"
+BUILD = "motion-context-disk-v3.0.5"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -5124,8 +5124,15 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 if is_random_access else _validated_prefix_count(segments)
             )
             geometry = manifest.get("geometry") if isinstance(manifest.get("geometry"), dict) else {}
-            resolved_width = int(geometry.get("video_w", 0) or 0) * 16
-            resolved_height = int(geometry.get("video_h", 0) or 0) * 16
+            base_resolution = manifest.get("base_resolution") if isinstance(manifest.get("base_resolution"), dict) else {}
+            # Refresh/UI state must report the first-pass project resolution,
+            # not the physical refined/upscaled latent geometry.  The latter is
+            # still kept in manifest["geometry"] for Disk Join compatibility.
+            resolved_width = int(base_resolution.get("width", 0) or 0)
+            resolved_height = int(base_resolution.get("height", 0) or 0)
+            if resolved_width <= 0 or resolved_height <= 0:
+                resolved_width = int(geometry.get("video_w", 0) or 0) * 16
+                resolved_height = int(geometry.get("video_h", 0) or 0) * 16
             continuity_signatures = {}
             if is_fl2va:
                 from .fl2va_engine import continuity_signatures_for_segments

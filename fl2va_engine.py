@@ -1200,6 +1200,13 @@ def drop_fl2va_cached_ids(owner_id, fps, clip_ids, drop_ids, preserve_preview=Fa
         desc["index"] = idx
         desc["trim_frames"] = 0
     manifest["segments"] = segments
+    # Geometry describes the currently cached logical FL2VA chain. Once every
+    # segment has been invalidated there is no chain geometry left to enforce.
+    # Keeping the old value would make the first rerender (for example after
+    # Refine ON -> OFF, OFF -> ON, or a resolution change) fail against a
+    # stale geometry from the discarded cache.
+    if not segments:
+        manifest["geometry"] = None
     manifest["final_frame_count"] = _final_frame_count(segments)
     manifest["updated_at"] = time.time()
     _write_json_atomic(manifest_path, manifest)
@@ -1387,6 +1394,11 @@ def sync_fl2va_manifest(owner_id, fps: float, clip_ids):
     if ordered != list(manifest.get("segments", [])):
         manifest = _invalidate_derived_preview(data_path, manifest)
     manifest["segments"] = ordered
+    # The geometry belongs to cached segments, not to the project forever.
+    # If syncing card IDs leaves no cached segment, the next stored clip must
+    # be allowed to establish its own geometry.
+    if not ordered:
+        manifest["geometry"] = None
     manifest["final_frame_count"] = _final_frame_count(ordered)
     manifest["updated_at"] = time.time()
     _write_json_atomic(manifest_path, manifest)

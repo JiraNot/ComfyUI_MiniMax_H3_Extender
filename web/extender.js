@@ -1405,7 +1405,7 @@ async function restoreCacheState(node, runtime) {
 
         // Do not overwrite live execution information if generation started
         // while the startup request was in flight.
-        if (["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""))) {
+        if (["preparing", "sampling", "refining", "complete"].includes(String(runtime.activePhase || ""))) {
             return;
         }
 
@@ -1577,7 +1577,7 @@ async function discardComputedClip(node, runtime, clipIndex) {
 async function requestFullBatchInterrupt(node, runtime) {
     if (!node || !runtime || runtime.interruptRequested || runtime.interruptRequestBusy) return;
     const runMode = String(getWidget(node, "run_mode")?.value || "clip_by_clip");
-    const active = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+    const active = ["preparing", "sampling", "refining", "complete"].includes(String(runtime.activePhase || ""));
     if (runMode !== "full_batch" || !active) return;
 
     runtime.interruptRequestBusy = true;
@@ -2258,7 +2258,7 @@ function advanceSeedAfterGenerate(clip) {
 function cardStatus(node, runtime, clip, index) {
     const activeIndex = Number(runtime.activeClipIndex);
     const activePhase = String(runtime.activePhase || "");
-    const runActive = ["preparing", "sampling", "complete"].includes(activePhase);
+    const runActive = ["preparing", "sampling", "refining", "complete"].includes(activePhase);
 
     if (activeIndex === index && runActive) {
         return "rendering";
@@ -4873,7 +4873,7 @@ function resetRuntimeForNewProject(node, runtime) {
 }
 
 function projectBusy(runtime) {
-    return ["preparing", "sampling", "complete"].includes(String(runtime?.activePhase || ""));
+    return ["preparing", "sampling", "refining", "complete"].includes(String(runtime?.activePhase || ""));
 }
 
 function setProjectButtonsBusy(runtime, busy) {
@@ -5749,8 +5749,10 @@ function render(node, runtime) {
             : "Causal Ref2VA chain: each clip receives Motion Context from the previous clip";
     }
     const refineOn = boolValue(runtime.refineEnabledWidget?.value, false);
+    const refineUiBusy = projectBusy(runtime);
     state.refine_enabled = refineOn;
     if (runtime.refineButton) {
+        runtime.refineButton.disabled = refineUiBusy;
         runtime.refineButton.textContent = refineOn ? "REFINE: ON" : "REFINE: OFF";
         runtime.refineButton.title = refineOn
             ? "Direct latent upscale + refine is active; changing it invalidates generated clips"
@@ -5771,9 +5773,18 @@ function render(node, runtime) {
         const shouldOpen = Boolean(runtime.refineSettingsOpen);
         if (runtime.refinePanel.open !== shouldOpen) runtime.refinePanel.open = shouldOpen;
     }
-    if (runtime.refineScaleInput) runtime.refineScaleInput.value = String(runtime.refineScaleWidget?.value ?? 1.5);
-    if (runtime.refineStepsInput) runtime.refineStepsInput.value = String(runtime.refineStepsWidget?.value ?? 4);
-    if (runtime.refineDenoiseInput) runtime.refineDenoiseInput.value = String(runtime.refineDenoiseWidget?.value ?? 0.30);
+    if (runtime.refineScaleInput) {
+        runtime.refineScaleInput.value = String(runtime.refineScaleWidget?.value ?? 1.5);
+        runtime.refineScaleInput.disabled = refineUiBusy;
+    }
+    if (runtime.refineStepsInput) {
+        runtime.refineStepsInput.value = String(runtime.refineStepsWidget?.value ?? 4);
+        runtime.refineStepsInput.disabled = refineUiBusy;
+    }
+    if (runtime.refineDenoiseInput) {
+        runtime.refineDenoiseInput.value = String(runtime.refineDenoiseWidget?.value ?? 0.30);
+        runtime.refineDenoiseInput.disabled = refineUiBusy;
+    }
     if (runtime.refineTargetLabel) {
         const target = currentRefineTargetResolution(node, runtime);
         runtime.refineTargetLabel.textContent = target
@@ -5785,7 +5796,7 @@ function render(node, runtime) {
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = state.motion_context !== false;
     if (runtime.refsSection) runtime.refsSection.style.display = "block";
     if (runtime.interruptButton) {
-        const active = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+        const active = ["preparing", "sampling", "refining", "complete"].includes(String(runtime.activePhase || ""));
         const fullBatch = String(getWidget(node, "run_mode")?.value || "clip_by_clip") === "full_batch";
         runtime.interruptButton.style.display = active && fullBatch ? "inline-block" : "none";
         runtime.interruptButton.disabled = !active || !fullBatch || Boolean(runtime.interruptRequested || runtime.interruptRequestBusy);
@@ -5870,7 +5881,7 @@ function render(node, runtime) {
         const colorButton = document.createElement("button");
         colorButton.type = "button";
         colorButton.textContent = "🎨";
-        const colorBusy = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+        const colorBusy = ["preparing", "sampling", "refining", "complete"].includes(String(runtime.activePhase || ""));
         const colorCached = randomAccess
             ? runtime.cachedClipIds?.has(String(clip.id))
             : index < Number(runtime.cachedCount || 0);
@@ -6671,7 +6682,7 @@ function render(node, runtime) {
             reroll.style.width = "27px";
             reroll.style.height = "22px";
             reroll.style.padding = "0";
-            reroll.disabled = Boolean(runtime.discardComputedBusy || ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || "")));
+            reroll.disabled = Boolean(runtime.discardComputedBusy || ["preparing", "sampling", "refining", "complete"].includes(String(runtime.activePhase || "")));
             reroll.addEventListener("click", (event) => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -7810,7 +7821,7 @@ function clearTransientRenderingState(statusText = null) {
 
         const wasActive =
             Number(runtime.activeClipIndex) >= 0 ||
-            ["preparing", "sampling", "complete"].includes(
+            ["preparing", "sampling", "refining", "complete"].includes(
                 String(runtime.activePhase || "")
             );
         if (!wasActive) continue;

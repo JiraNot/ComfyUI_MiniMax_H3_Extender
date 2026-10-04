@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.0.5"
+BUILD = "minimax-h3-extender-v3.0.6"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -4747,7 +4747,8 @@ def _import_project_archive(owner_id, archive_path):
 
 PROJECT_SETTING_NAMES = (
     "run_mode", "width", "height", "ref_image_size", "steps", "sampler_name",
-    "scheduler", "denoise", "context_length", "audio_context_length", "clips_json",
+    "scheduler", "denoise", "refine_enabled", "refine_scale", "refine_steps", "refine_denoise",
+    "context_length", "audio_context_length", "clips_json",
     "resolution_mode", "megapixels", "refs_json", "generation_mode", "motion_context",
 )
 

@@ -1,4 +1,4 @@
-__version__ = "3.0.5"
+__version__ = "3.0.6"
 
 from .node import (
     NODE_CLASS_MAPPINGS as UTILITY_NODE_CLASS_MAPPINGS,

@@ -5633,11 +5633,17 @@ function syncFl2vaHorizontalScroll(runtime) {
     runtime.refsRow.scrollLeft = left;
 }
 
+// Modified by JiraNot: show that FL2VA global character references are active.
 function renderMediaStrip(node, runtime, fl2vaMode) {
     if (runtime?.refsHeader) {
-        runtime.refsHeader.textContent = fl2vaMode
-            ? "FL2VA FIRST / LAST FRAMES — per-clip IMAGE GUIDES are inside each card"
-            : "REFERENCE IMAGES — double-click a thumbnail to edit";
+        if (fl2vaMode) {
+            const refCount = (runtime.refsState?.refs || []).filter(Boolean).length;
+            runtime.refsHeader.textContent =
+                `FL2VA FIRST / LAST FRAMES — per-clip IMAGE GUIDES are inside each card | `
+                + `Character refs: ${refCount} active (switch to Ref2VA to edit)`;
+        } else {
+            runtime.refsHeader.textContent = "REFERENCE IMAGES — double-click a thumbnail to edit";
+        }
     }
     if (runtime?.refsRow) {
         runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";

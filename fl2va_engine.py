@@ -4,6 +4,9 @@ This module deliberately keeps FL2VA conditioning/cache behaviour separate from
 Ref2VA + Motion Context.  FL2VA cards are independent plans: each card can have
 its own optional first/last frame and cached latent, and replacing/inserting one
 card does not invalidate the other cached cards.
+
+Modified by JiraNot: accepts global image references separately from temporal
+first/last-frame keyframes for FL2VA conditioning.
 """
 from __future__ import annotations
 
@@ -1253,6 +1256,7 @@ def make_fl2va_conditioning(
     frame_count: int,
     first_frame=None,
     last_frame=None,
+    reference_images=None,
     guide_frames=None,
     guide_frame=None,
     guide_frame_idx: int = 0,
@@ -1269,7 +1273,11 @@ def make_fl2va_conditioning(
     """
     frame_count = _align_frame_count(frame_count)
     latent = _empty_av_latent(width, height, frame_count)
-    images = []
+    # FL2VA's native ImageToVideo node accepts multiple vision images while
+    # retaining First/Last as separate temporal keyframes. External character
+    # references are prepended so their Picture labels stay stable; the frame
+    # images continue to anchor frame 0 and the final frame below.
+    images = list(reference_images or [])
     keyframes = []
 
     if first_frame is not None:
@@ -1464,6 +1472,11 @@ def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, v
     dependency_meta = dependency_meta if isinstance(dependency_meta, dict) else {}
     first_source = str(dependency_meta.get("first_source") or "manual").lower().strip()
     desc["first_source"] = "previous_clip" if first_source == "previous_clip" else "manual"
+    reference_signature = str(dependency_meta.get("reference_signature") or "").strip()
+    if reference_signature:
+        desc["reference_signature"] = reference_signature
+    else:
+        desc.pop("reference_signature", None)
     if desc["first_source"] == "previous_clip":
         desc["previous_clip_id"] = str(dependency_meta.get("previous_clip_id") or "")
         desc["previous_frame_signature"] = str(dependency_meta.get("previous_frame_signature") or "")

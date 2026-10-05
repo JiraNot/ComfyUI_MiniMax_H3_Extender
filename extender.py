@@ -9,6 +9,9 @@ validated disk cache and the separate Final Decode / Preview node.
 The node intentionally accepts an already-patched H3 MODEL. Sigma-shift,
 upstream LoRA, Spectrum or other model patches therefore compose normally
 before the Extender; optional card-local LoRAs can be stacked on top per clip.
+
+Modified by JiraNot: FL2VA can consume one global Picture reference while preserving
+the card's independent first/last-frame temporal keyframes.
 """
 
 from __future__ import annotations
@@ -1786,6 +1789,32 @@ def _resize(image, width: int, height: int):
         samples, int(width), int(height), "lanczos", "disabled"
     )
     return samples.movedim(1, -1)
+
+
+def _prepare_fl2va_reference_images(refs, width: int, height: int, ref_image_size: str):
+    """Load global Picture refs for FL2VA vision conditioning, preserving slots."""
+    ref_images = []
+    active_slots = []
+    for slot, descriptor in enumerate(_normalize_ref_descriptors(refs), start=1):
+        if descriptor is None:
+            continue
+        image = _load_reference_tensor(descriptor)
+        image_height, image_width = int(image.shape[1]), int(image.shape[2])
+        if str(ref_image_size) == "match":
+            scale = min(1.0, math.sqrt((int(width) * int(height)) / float(image_width * image_height)))
+        else:
+            scale = min(1.0, REF_IMAGE_SHORT_EDGE / float(min(image_width, image_height)))
+        target_width = max(
+            CANVAS_MULTIPLE,
+            round(image_width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE,
+        )
+        target_height = max(
+            CANVAS_MULTIPLE,
+            round(image_height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE,
+        )
+        ref_images.append(_resize(image[:1], target_width, target_height))
+        active_slots.append(slot)
+    return ref_images, active_slots
 
 
 def _adapt_ref_video_canvas(width: int, height: int):
@@ -5148,6 +5177,9 @@ class MiniMaxH3Extender:
         vae,
         audio_vae,
         run_mode,
+        ref_image_size,
+        refs,
+        reference_signature,
         width,
         height,
         steps,
@@ -5218,6 +5250,9 @@ class MiniMaxH3Extender:
         resolution["cache_reset"] = bool(source_working_changed)
         resolved_width = int(resolution["width"])
         resolved_height = int(resolution["height"])
+        reference_images, active_picture_slots = _prepare_fl2va_reference_images(
+            refs, resolved_width, resolved_height, ref_image_size
+        )
 
         cache_resolution = _resolution_from_manifest(manifest)
         previous_cache_resolution = None
@@ -5340,6 +5375,7 @@ class MiniMaxH3Extender:
 
             first_frame = None
             dependency_meta = {"first_source": first_source}
+            dependency_meta["reference_signature"] = reference_signature
             if first_source == "previous_clip":
                 previous_clip_id = clip_ids[i - 1]
                 first_frame, previous_signature = resolve_fl2va_previous_frame(
@@ -5358,7 +5394,14 @@ class MiniMaxH3Extender:
                 stored_source = str(current_desc.get("first_source") or "manual")
                 if stored_source != first_source:
                     stale_dependency = True
-                elif first_source == "previous_clip":
+                else:
+                    stored_reference_signature = str(current_desc.get("reference_signature") or "")
+                    if (
+                        (stored_reference_signature and stored_reference_signature != reference_signature)
+                        or (_reference_count(refs) and not stored_reference_signature)
+                    ):
+                        stale_dependency = True
+                if not stale_dependency and first_source == "previous_clip":
                     stale_dependency = (
                         str(current_desc.get("previous_clip_id") or "") != str(dependency_meta["previous_clip_id"])
                         or str(current_desc.get("previous_frame_signature") or "") != str(dependency_meta["previous_frame_signature"])
@@ -5371,7 +5414,7 @@ class MiniMaxH3Extender:
                         del first_frame
                     labels = ", ".join(str(idx + 1) for idx in locked)
                     raise RuntimeError(
-                        "MiniMax H3 Extender: FL2VA Previous dependency changed for "
+                        "MiniMax H3 Extender: FL2VA render dependencies changed for "
                         f"Validated clip(s) {labels}. Refusing to invalidate or rerender "
                         "a validated clip automatically. Uncheck Validated explicitly on "
                         "the affected clip(s) before rerunning."
@@ -5483,12 +5526,13 @@ class MiniMaxH3Extender:
             positive, latent = make_fl2va_conditioning(
                 clip_text_encoder,
                 vae,
-                cfg.get("prompt", ""),
+                _remap_numbered_tags(cfg.get("prompt", ""), active_picture_slots, [], []),
                 resolved_width,
                 resolved_height,
                 frame_count,
                 first_frame=first_frame,
                 last_frame=last_frame,
+                reference_images=reference_images,
                 guide_frames=guide_frames,
             )
 
@@ -5708,7 +5752,7 @@ class MiniMaxH3Extender:
             )
 
         status = (
-            f"FL2VA {str(run_mode)} | {resolution_text} | "
+            f"FL2VA {str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | "
             f"cached {cached_count}/{len(clips)} | validated {validated_count} | "
             + (
                 "generated " + ",".join(str(i + 1) for i in generated)
@@ -5752,7 +5796,7 @@ class MiniMaxH3Extender:
             "continue_existing_video": dict(continue_existing_video) if continue_existing_video is not None else None,
             "source_video_normalized": dict(source_meta) if source_meta is not None else None,
             "continue_video_resize": dict(continue_video_resize) if continue_existing_video is not None else None,
-            "reference_count": 0,
+            "reference_count": int(_reference_count(refs)),
             "reference_video_count": 0,
             "reference_video_audio_count": 0,
             "reference_audio_count": 0,
@@ -5844,6 +5888,23 @@ class MiniMaxH3Extender:
         requested_export_profile = _final_decode_profile_from_prompt(prompt, owner)
 
         if generation_mode == "fl2va":
+            refs = _parse_refs_json(refs_json)
+            external_ref_pack = _normalize_external_ref_pack(ref_pack)
+            refs, imported_slots, skipped_slots = _sync_refs_from_ref_pack(refs, external_ref_pack)
+            if _reference_count(refs) > 1:
+                raise ValueError(
+                    "MiniMax H3 Extender: FL2VA currently supports one global character reference."
+                )
+            if (imported_slots or skipped_slots) and external_ref_pack is not None:
+                _send_extender_ref_pack_import(
+                    owner,
+                    _refs_json(refs),
+                    imported_slots,
+                    int(external_ref_pack.get("count", 0) or 0),
+                    external_ref_pack.get("source") or "External reference pack",
+                    skipped_slots=skipped_slots,
+                )
+            reference_signature = _refs_signature(refs)
             return self._extend_fl2va(
                 owner=owner,
                 clips=clips,
@@ -5856,6 +5917,9 @@ class MiniMaxH3Extender:
                 vae=vae,
                 audio_vae=kwargs.get("audio_vae"),
                 run_mode=run_mode,
+                ref_image_size=ref_image_size,
+                refs=refs,
+                reference_signature=reference_signature,
                 width=width,
                 height=height,
                 steps=steps,
@@ -6902,6 +6966,23 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 
 if getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.get("/h3_extender/capabilities")
+    async def h3_extender_capabilities(_request):
+        """Advertise the tested FL2VA reference path for capability routing."""
+        return web.json_response({
+            "protocol": 1,
+            "plugin": "minimax-h3-extender",
+            "build": BUILD,
+            "modes": {
+                "fl2va": {
+                    "firstFrame": True,
+                    "lastFrame": True,
+                    "maxGlobalImageReferences": 1,
+                    "referenceConditioning": "image_tokens",
+                },
+            },
+        })
+
     @PromptServer.instance.routes.post("/h3_extender/project/new")
     async def h3_extender_project_new(request):
         """Start a clean Extender project while leaving node settings untouched."""

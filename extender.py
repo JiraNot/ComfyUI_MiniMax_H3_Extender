@@ -38,7 +38,12 @@ import zipfile
 from collections.abc import Mapping
 import numpy as np
 import torch
-import torchaudio
+try:
+    import torchaudio
+except ImportError:
+    # Audio-reference resampling is optional; do not disable all H3 video nodes
+    # when a ComfyUI install does not ship a matching torchaudio build.
+    torchaudio = None
 import comfy.model_management
 import comfy.sd
 import comfy.nested_tensor
@@ -1988,6 +1993,11 @@ def _encode_ref_audio(audio_vae, audio):
     sr = int(audio["sample_rate"])
     vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if sr != vae_sr:
+        if torchaudio is None:
+            raise RuntimeError(
+                "MiniMax H3 Extender: torchaudio is required to resample audio-reference input. "
+                "Install a torchaudio build compatible with ComfyUI's PyTorch."
+            )
         waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
     latent = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return latent, int(latent.shape[-1])

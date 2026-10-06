@@ -140,7 +140,7 @@ class Autosave(unittest.TestCase):
         self.assertEqual(first['project_snapshot']['project']['extender']['settings']['width'], 896)
         self.assertEqual(json.loads(first['project_snapshot']['project']['extender']['clips_json'])['clips'][0]['seed'], 10)
 
-    def test_option_default_false_appended_and_export_hooks_after_video(self):
+    def test_project_options_preserve_widget_order_and_export_hooks_after_video(self):
         source = (ROOT/'motion_context_disk.py').read_text()
         tree = ast.parse(source)
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MiniMaxH3MotionContextDiskFinalDecode')
@@ -150,8 +150,11 @@ class Autosave(unittest.TestCase):
         ns = {'CACHE_TYPE': 'CACHE'}
         exec(compile(ast.Module(body=[method], type_ignores=[]), 'schema', 'exec'), ns)
         required = ns['INPUT_TYPES'](None)['required']
-        self.assertEqual(list(required)[-1], 'auto_save_project')
+        # auto_save_project was already appended to older workflows. Keep it
+        # before the newer option so persisted widget arrays still address it.
+        self.assertEqual(list(required)[-2:], ['auto_save_project', 'save_individual_clips'])
         self.assertIs(required['auto_save_project'][1]['default'], False)
+        self.assertIs(required['save_individual_clips'][1]['default'], False)
         for filename, function in [('motion_context_disk.py', 'export'), ('fl2va_engine.py', 'export_fl2va_final')]:
             module = ast.parse((ROOT/filename).read_text())
             node = next(n for n in ast.walk(module) if isinstance(n, ast.FunctionDef) and n.name == function)
